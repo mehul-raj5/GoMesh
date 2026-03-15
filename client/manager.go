@@ -114,9 +114,7 @@ func (m *ClientManager) GetGroupMembers(groupID [common.IDSize]byte) [][common.I
 	defer m.mu.Unlock()
 	var members [][common.IDSize]byte
 	if info, ok := m.Conversations[groupID]; ok {
-		for _, id := range info.Members {
-			members = append(members, id)
-		}
+		members = append(members, info.Members...)
 	}
 	return members
 }

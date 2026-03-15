@@ -712,17 +712,7 @@ func sendPacket(pkt *common.Packet) error {
 	return pkt.Encode(conn)
 }
 
-func sendCtrlPubRq(userID [16]byte) {
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType:  common.CtrlPubRq,
-			SenderID: mgr.UserID,
-			BodyLen:  16,
-		},
-		Body: userID[:],
-	}
-	sendPacket(&pkt)
-}
+
 
 func rotateGroupKey(groupID [16]byte) {
 	rotationMu.Lock()

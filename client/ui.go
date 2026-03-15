@@ -37,7 +37,6 @@ type appModel struct {
 
 	fileProgress  progress.Model
 	isDownloading bool
-	err           error
 
 	activeConv [16]byte
 

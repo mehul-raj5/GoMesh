@@ -266,9 +266,7 @@ func (s *Server) handleGroupAdd(sender *Client, p common.Packet) {
 		}
 	}
 	members := make([][16]byte, 0, len(conv.Members))
-	for _, m := range conv.Members {
-		members = append(members, m)
-	}
+	members = append(members, conv.Members...)
 	s.mu.RUnlock()
 
 	syncResp := common.Packet{
@@ -372,9 +370,7 @@ func (s *Server) handleGroupRemove(sender *Client, p common.Packet) {
 
 	s.mu.RLock()
 	members := make([][16]byte, 0, len(conv.Members))
-	for _, m := range conv.Members {
-		members = append(members, m)
-	}
+	members = append(members, conv.Members...)
 	s.mu.RUnlock()
 
 	for _, m := range members {
@@ -436,9 +432,7 @@ func (s *Server) handleGroupMakeAdmin(sender *Client, p common.Packet) {
 
 	s.mu.RLock()
 	members := make([][16]byte, 0, len(conv.Members))
-	for _, m := range conv.Members {
-		members = append(members, m)
-	}
+	members = append(members, conv.Members...)
 	s.mu.RUnlock()
 
 	for _, m := range members {
@@ -500,9 +494,7 @@ func (s *Server) handleGroupRemoveAdmin(sender *Client, p common.Packet) {
 
 	s.mu.RLock()
 	members := make([][16]byte, 0, len(conv.Members))
-	for _, m := range conv.Members {
-		members = append(members, m)
-	}
+	members = append(members, conv.Members...)
 	s.mu.RUnlock()
 
 	for _, m := range members {
@@ -842,9 +834,7 @@ func (s *Server) broadcastMakeAdmin(convID, targetID [common.IDSize]byte) {
 		return
 	}
 	members := make([][16]byte, 0, len(conv.Members))
-	for _, m := range conv.Members {
-		members = append(members, m)
-	}
+	members = append(members, conv.Members...)
 	s.mu.RUnlock()
 	for _, m := range members {
 		s.sendPacket(m, resp)

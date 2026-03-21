@@ -1,11 +1,11 @@
-# ConnHub: Comprehensive Project Documentation
+# GoMesh: Comprehensive Project Documentation
 
-This document provides an exhaustive, self-explanatory guide to every mechanism, byte pattern, cryptographic algorithm, and component within the `ConnHub` project. `ConnHub` is a secure messaging application supporting End-to-End Encrypted (E2EE) private chats, group messaging, and file transfers over a custom TCP protocol.
+This document provides an exhaustive, self-explanatory guide to every mechanism, byte pattern, cryptographic algorithm, and component within the `GoMesh` project. `GoMesh` is a secure messaging application supporting End-to-End Encrypted (E2EE) private chats, group messaging, and file transfers over a custom TCP protocol.
 
 ---
 
 ## 1. Cryptography Architecture (`Common/crypto_utils.go`)
-The security of ConnHub relies on several state-of-the-art cryptographic primitives.
+The security of GoMesh relies on several state-of-the-art cryptographic primitives.
 
 ### 1.1 Core Algorithms
 - **X25519 (ECDH)**: Elliptic-Curve Diffie-Hellman over Curve25519. Used for establishing shared secrets during handshakes.

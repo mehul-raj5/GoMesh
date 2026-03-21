@@ -52,7 +52,7 @@ func initialModel() appModel {
 	ta.SetHeight(3)
 
 	vp := viewport.New(60, 20)
-	vp.SetContent("Welcome to ConnHub!\nType /help for commands.")
+	vp.SetContent("Welcome to GoMesh!\nType /help for commands.")
 
 	vpSys := viewport.New(20, 20)
 	vpSys.SetContent("System & Command Logs")
@@ -327,7 +327,7 @@ func (m appModel) View() string {
 		PaddingRight(1).
 		MarginBottom(1)
 
-	headerText := fmt.Sprintf(" ConnHub E2EE | %s | Active: %s ", statusLine, activeName)
+	headerText := fmt.Sprintf(" GoMesh E2EE | %s | Active: %s ", statusLine, activeName)
 	header := headerConfig.Render(headerText)
 
 	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))

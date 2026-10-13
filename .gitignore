@@ -13,6 +13,7 @@
 
 # General exclusions
 *.key
+gomesh-state/
 *.log
 *.exe
 *.out

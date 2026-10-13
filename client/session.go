@@ -33,7 +33,8 @@ var (
 func Recoverable(err error) bool {
 	return errors.Is(err, ErrNoSession) ||
 		errors.Is(err, ErrNoGroupSession) ||
-		errors.Is(err, ErrNoSenderKey)
+		errors.Is(err, ErrNoSenderKey) ||
+		errors.Is(err, ErrEpochGap)
 }
 
 // chainState is one receiving ratchet: the key for the next expected message,
@@ -48,22 +49,6 @@ type chainState struct {
 
 func newChainState(key [32]byte) chainState {
 	return chainState{Key: key, Skipped: make(map[uint32][32]byte)}
-}
-
-type Session struct {
-	ConversationID [16]byte
-
-	// PeerID is stored because it cannot be recovered: the conversation ID is
-	// a hash of the two user IDs, so there is no way back from one to the other.
-	PeerID [16]byte
-
-	SendChainKey [32]byte
-	SendCount    uint32
-
-	recv chainState
-
-	CreatedAt time.Time
-	mu        sync.Mutex
 }
 
 // senderChain is one member's sending ratchet as a receiver sees it, tagged
@@ -99,78 +84,46 @@ type GroupSession struct {
 
 type SessionManager struct {
 	sessions      map[[16]byte]*Session
+	aux           map[[16]byte][]*auxSession
 	groupSessions map[[16]byte]*GroupSession
 	mu            sync.RWMutex
 	identity      *IdentityManager
 
-	// selfID decides which half of the derived root this client sends on. It is
-	// assigned by the server at login, so it is not available on IdentityManager.
+	// store holds saved direct sessions. It is the identity's store unless a
+	// caller replaces it, and nothing is saved while it is nil.
+	store *StateStore
+
+	// selfID decides which direction this client owns. It is assigned by the
+	// server at login, so it is not available on IdentityManager.
 	selfID [16]byte
+
+	// KnownKey looks up the identity key the server's directory holds for a
+	// user. A first message carries the sender's key in its own header, and this
+	// is how that claim is checked, if the directory has been consulted yet.
+	KnownKey func(id [16]byte) ([32]byte, bool)
+
+	// OnReplaced is called, with no lock held, after a message's handshake
+	// replaces a session that was already in place. Whatever was held for the old
+	// session can never be read now.
+	OnReplaced func(convID [16]byte)
+
+	now func() time.Time
 }
 
 func NewSessionManager(idMgr *IdentityManager, selfID [16]byte) *SessionManager {
+	var store *StateStore
+	if idMgr != nil {
+		store = idMgr.store
+	}
 	return &SessionManager{
+		store:         store,
 		sessions:      make(map[[16]byte]*Session),
+		aux:           make(map[[16]byte][]*auxSession),
 		groupSessions: make(map[[16]byte]*GroupSession),
 		identity:      idMgr,
 		selfID:        selfID,
+		now:           time.Now,
 	}
-}
-
-func (sm *SessionManager) GetSession(convID [16]byte) (*Session, bool) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	sess, ok := sm.sessions[convID]
-	return sess, ok
-}
-
-func (sm *SessionManager) saveSession(convID, peerID [16]byte, sendKey, recvKey [32]byte) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.sessions[convID] = &Session{
-		ConversationID: convID,
-		PeerID:         peerID,
-		SendChainKey:   sendKey,
-		recv:           newChainState(recvKey),
-		CreatedAt:      time.Now(),
-	}
-}
-
-// DeriveDirectSession establishes the session for a direct conversation from
-// identity keys alone. Both peers call this and land on the same pair of chains
-// without exchanging anything: the Diffie-Hellman is symmetric, and the send
-// and receive roles are settled by comparing the two user IDs rather than by
-// who spoke first. That is what lets the initiator start sending before the
-// peer has any idea the conversation exists.
-//
-// One consequence to be aware of: the root is a fixed function of the two
-// identity keys, so it is the same on every run. Sessions are held only in
-// memory, so reconnecting and reopening a chat restarts the send chain from
-// that same root and reissues message keys that have already been used.
-// Persisting chain state across restarts, or mixing an ephemeral key into the
-// root, would each remove that; both are deliberately out of scope here.
-func (sm *SessionManager) DeriveDirectSession(convID, peerID [16]byte, peerPubKey [32]byte) error {
-	if !common.IsValidKey(peerPubKey) {
-		return fmt.Errorf("peer %x has no identity key", peerID[:4])
-	}
-
-	secret, err := common.DeriveSharedSecret(sm.identity.PrivateKey, peerPubKey)
-	if err != nil {
-		return err
-	}
-	rootA, rootB := common.DeriveRatchetRoots(secret)
-
-	// Exactly one side takes rootA to send on. Deciding it by ID order rather
-	// than by role means both sides reach the same answer independently; if they
-	// both chose the same half, each would encrypt on the chain the other is
-	// also encrypting on and nothing would decrypt in either direction.
-	sendKey, recvKey := rootA, rootB
-	if !common.LowerID(sm.selfID, peerID) {
-		sendKey, recvKey = rootB, rootA
-	}
-
-	sm.saveSession(convID, peerID, sendKey, recvKey)
-	return nil
 }
 
 // aadFor binds a packet's header and the plaintext counters in its body to the
@@ -247,80 +200,6 @@ func advanceChain(c *chainState, seq uint32) (chainAdvance, error) {
 	}
 	a.MsgKey, a.nextKey = common.RatchetStep(a.nextKey)
 	return a, nil
-}
-
-func (sm *SessionManager) EncryptPacket(pkt *common.Packet) error {
-	session, ok := sm.GetSession(pkt.Header.ConversationID)
-	if !ok {
-		return fmt.Errorf("%w: %x", ErrNoSession, pkt.Header.ConversationID[:4])
-	}
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-
-	msgKey, nextChain := common.RatchetStep(session.SendChainKey)
-	seq := session.SendCount
-
-	expectedEncryptedLen := len(pkt.Body) + common.NonceSize + 16
-	pkt.Header.BodyLen = uint32(4 + expectedEncryptedLen)
-	pkt.Header.Flags |= common.FlagEncrypted
-
-	encryptedBody, err := common.Encrypt(msgKey, pkt.Body, aadFor(&pkt.Header, seq))
-	if err != nil {
-		return err
-	}
-
-	finalPayload := make([]byte, 4+len(encryptedBody))
-	binary.BigEndian.PutUint32(finalPayload[0:], seq)
-	copy(finalPayload[4:], encryptedBody)
-
-	pkt.Body = finalPayload
-
-	session.SendChainKey = nextChain
-	session.SendCount++
-
-	return nil
-}
-
-func (sm *SessionManager) DecryptPacket(pkt *common.Packet) error {
-	if pkt.Header.Flags&common.FlagEncrypted == 0 {
-		return nil
-	}
-
-	session, ok := sm.GetSession(pkt.Header.ConversationID)
-	if !ok {
-		return fmt.Errorf("%w: %x", ErrNoSession, pkt.Header.ConversationID[:4])
-	}
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-
-	if len(pkt.Body) < 4+common.NonceSize {
-		return fmt.Errorf("packet too short for ratcheted E2EE")
-	}
-
-	seq := binary.BigEndian.Uint32(pkt.Body[0:4])
-	ciphertext := pkt.Body[4:]
-
-	adv, err := advanceChain(&session.recv, seq)
-	if err != nil {
-		return err
-	}
-
-	// The associated data has to be built before the header is rewritten below,
-	// so that it matches what the sender authenticated.
-	decrypted, err := common.Decrypt(adv.MsgKey, ciphertext, aadFor(&pkt.Header, seq))
-	if err != nil {
-		// The chain is untouched, so a forged sequence number cannot strand it
-		// ahead of the real traffic and a replay cannot destroy a skipped key.
-		return fmt.Errorf("decryption failed for seq %d: %v", seq, err)
-	}
-	adv.commit(&session.recv)
-
-	pkt.Body = decrypted
-	pkt.Header.BodyLen = uint32(len(decrypted))
-	pkt.Header.Flags &^= common.FlagEncrypted
-	return nil
 }
 
 func (sm *SessionManager) GetGroupSession(groupID [16]byte) (*GroupSession, bool) {

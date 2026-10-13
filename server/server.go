@@ -19,6 +19,11 @@ type User struct {
 	Username    string
 	IdentityKey [32]byte
 
+	// Bundle is the public prekey material handed to anyone opening a chat with
+	// this user. IdentityKey is kept alongside it because the group paths still
+	// read it directly. The server never holds a private half of anything here.
+	Bundle common.PreKeyBundle
+
 	OfflineQueue []common.Packet
 }
 
@@ -152,26 +157,34 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	if len(p.Body) < 32 {
-		log.Printf("Login payload too short")
+	bundle, username, err := common.DecodeLogin(p.Body)
+	if err != nil {
+		log.Printf("Login payload malformed: %v", err)
+		return
+	}
+	log.Printf("Login: %s", username)
+
+	reject := func() {
+		errPkt := common.Packet{Header: common.Header{MsgType: common.CtrlError}}
+		errPkt.Encode(conn)
+	}
+
+	// A bundle that does not verify never earns a challenge.
+	if !bundle.Verify() {
+		log.Printf("Login rejected for %s: invalid prekey bundle", username)
+		reject()
+		return
+	}
+	if err := s.proveKeyPossession(conn, username, bundle); err != nil {
+		log.Printf("Login rejected for %s: %v", username, err)
+		reject()
 		return
 	}
 
-	var pubKey [32]byte
-	copy(pubKey[:], p.Body[:32])
-	username := string(p.Body[32:])
-	log.Printf("Login: %s", username)
-
-	userID, err := s.authenticateUser(username, pubKey)
+	userID, err := s.authenticateUser(username, bundle)
 	if err != nil {
 		log.Printf("Login rejected for %s: %v", username, err)
-		errPkt := common.Packet{
-			Header: common.Header{
-				MsgType: common.CtrlError,
-				BodyLen: 0,
-			},
-		}
-		errPkt.Encode(conn)
+		reject()
 		return
 	}
 
@@ -212,6 +225,46 @@ func (s *Server) handleConnection(conn net.Conn) {
 		p.Header.SenderID = userID
 		s.handlePacket(client, p)
 	}
+}
+
+// loginProofTimeout bounds how long a connection may sit on a challenge. The
+// socket has no other deadline at this stage, so without it an unanswered
+// challenge would hold a goroutine for as long as the peer cared to stay quiet.
+const loginProofTimeout = 10 * time.Second
+
+// proveKeyPossession issues a fresh challenge and checks the reply against the
+// signing key in the bundle. That is enough on its own for a new account, which
+// shows the registrant holds the key it is registering, and for a returning one
+// authenticateUser then insists the key is the one pinned at first login.
+func (s *Server) proveKeyPossession(conn net.Conn, username string, b common.PreKeyBundle) error {
+	var nonce [common.LoginNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	challenge := common.Packet{
+		Header: common.Header{MsgType: common.CtrlLoginChallenge, BodyLen: common.LoginNonceSize},
+		Body:   nonce[:],
+	}
+	if err := challenge.Encode(conn); err != nil {
+		return err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(loginProofTimeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	proof, err := common.Decode(conn)
+	if err != nil {
+		return fmt.Errorf("no login proof: %w", err)
+	}
+	if proof.Header.MsgType != common.CtrlLoginProof || len(proof.Body) != common.SignatureSize {
+		return errors.New("malformed login proof")
+	}
+	var sig [common.SignatureSize]byte
+	copy(sig[:], proof.Body)
+	if !common.VerifyLogin(b.SigningKey, nonce, b.IdentityKey, username, sig) {
+		return errors.New("login proof does not verify")
+	}
+	return nil
 }
 
 func (s *Server) handlePacket(sender *Client, p common.Packet) {
@@ -790,9 +843,9 @@ func (s *Server) handleDirectInit(sender *Client, p common.Packet) {
 		s.convs[convID] = conv
 	}
 
-	var targetPubKey [32]byte
+	var targetBundle common.PreKeyBundle
 	if u, ok := s.users[targetID]; ok {
-		targetPubKey = u.IdentityKey
+		targetBundle = u.Bundle
 	}
 
 	s.mu.Unlock()
@@ -802,12 +855,13 @@ func (s *Server) handleDirectInit(sender *Client, p common.Packet) {
 	// is what lets the initiator start sending while the target is offline.
 	//
 	// The target's user ID has to be here: the initiator needs it to decide
-	// which half of the derived root it sends on, and it cannot be recovered
-	// from the conversation ID, which is a hash.
-	ackBody := make([]byte, 0, 16+16+32+len(targetName))
+	// which direction it owns, and it cannot be recovered from the conversation
+	// ID, which is a hash. The bundle is what the initiator opens the session
+	// with; it checks the prekey signature itself rather than trusting this relay.
+	ackBody := make([]byte, 0, 16+16+common.PreKeyBundleSize+len(targetName))
 	ackBody = append(ackBody, convID[:]...)
 	ackBody = append(ackBody, targetID[:]...)
-	ackBody = append(ackBody, targetPubKey[:]...)
+	ackBody = append(ackBody, targetBundle.Encode()...)
 	ackBody = append(ackBody, []byte(targetName)...)
 
 	ack := common.Packet{
@@ -856,6 +910,7 @@ func (s *Server) handleConvInfoRq(sender *Client, p common.Packet) {
 		m := common.ConvMember{UserID: mID}
 		if u, ok := s.users[mID]; ok {
 			m.PubKey = u.IdentityKey
+			m.SigningKey = u.Bundle.SigningKey
 			m.Name = u.Username
 		}
 		info.Members = append(info.Members, m)
@@ -1061,20 +1116,28 @@ func (s *Server) takeOfflineQueue(userID [common.IDSize]byte) []common.Packet {
 	return queue
 }
 
-func (s *Server) authenticateUser(username string, pubKey [32]byte) ([common.IDSize]byte, error) {
+// authenticateUser registers a new username or admits a returning one.
+//
+// A bundle whose prekey signature does not check out is refused outright, so
+// the server never hands out a prekey that its own signing key did not vouch
+// for. The identity and signing keys are pinned on first use, as the identity
+// key always was: a returning user must present both unchanged. The signed
+// prekey alone may change between logins, which is how a client rotates it, and
+// the latest valid one wins.
+func (s *Server) authenticateUser(username string, bundle common.PreKeyBundle) ([common.IDSize]byte, error) {
+	if !bundle.Verify() {
+		return [common.IDSize]byte{}, errors.New("invalid prekey bundle")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	zero := [32]byte{}
-
 	if id, ok := s.usernames[username]; ok {
 		if u, exists := s.users[id]; exists {
-			if pubKey == zero {
-				return [common.IDSize]byte{}, errors.New("not allowed")
-			}
-			if pubKey != zero && u.IdentityKey != pubKey {
+			if u.IdentityKey != bundle.IdentityKey || u.Bundle.SigningKey != bundle.SigningKey {
 				return [common.IDSize]byte{}, errors.New("username already taken")
 			}
+			u.Bundle = bundle
 		}
 		return id, nil
 	}
@@ -1084,7 +1147,8 @@ func (s *Server) authenticateUser(username string, pubKey [32]byte) ([common.IDS
 	s.users[id] = &User{
 		ID:           id,
 		Username:     username,
-		IdentityKey:  pubKey,
+		IdentityKey:  bundle.IdentityKey,
+		Bundle:       bundle,
 		OfflineQueue: make([]common.Packet, 0),
 	}
 	return id, nil

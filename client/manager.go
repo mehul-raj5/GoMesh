@@ -199,6 +199,22 @@ func (m *ClientManager) RemoveConversation(id [common.IDSize]byte) {
 	delete(m.Conversations, id)
 }
 
+// HasConversation reports whether a conversation has been registered.
+func (m *ClientManager) HasConversation(id [common.IDSize]byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.Conversations[id]
+	return ok
+}
+
+// GetPublicKey returns the identity key the server's directory gave for a user.
+func (m *ClientManager) GetPublicKey(id [common.IDSize]byte) ([32]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.PublicKeys[id]
+	return k, ok
+}
+
 func (m *ClientManager) UpdatePublicKey(userID [common.IDSize]byte, key [32]byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

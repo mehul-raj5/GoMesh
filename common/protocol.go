@@ -14,13 +14,19 @@ const (
 	MsgText      uint8 = 0x01
 	MsgMediaMeta uint8 = 0x04 // E2E-encrypted media metadata envelope (Supabase direct-upload)
 
-	CtrlLogin            uint8 = 0x10
-	CtrlLoginAck         uint8 = 0x11
-	CtrlGroupCreate      uint8 = 0x12
-	CtrlGroupAdd         uint8 = 0x13
-	CtrlGroupRemove      uint8 = 0x14
-	CtrlDirectInit       uint8 = 0x15
-	CtrlDirectAck        uint8 = 0x16
+	CtrlLogin       uint8 = 0x10
+	CtrlLoginAck    uint8 = 0x11
+	CtrlGroupCreate uint8 = 0x12
+	CtrlGroupAdd    uint8 = 0x13
+	CtrlGroupRemove uint8 = 0x14
+	CtrlDirectInit  uint8 = 0x15
+	CtrlDirectAck   uint8 = 0x16
+	// Login is a three-step exchange: CtrlLogin names the account, the server
+	// answers with a random challenge, and the client proves it holds the
+	// account's signing key by signing it. Without the proof a public bundle,
+	// which the server hands to anyone, would be enough to log in as its owner.
+	CtrlLoginChallenge   uint8 = 0x17 // server -> client: body is a LoginNonceSize nonce
+	CtrlLoginProof       uint8 = 0x18 // client -> server: body is a signature over the nonce
 	CtrlGroupMakeAdmin   uint8 = 0x1B
 	CtrlGroupRemoveAdmin uint8 = 0x1C
 	// Sender-key group messaging: every member generates their own sending
@@ -266,10 +272,15 @@ type ConvMember struct {
 	UserID [IDSize]byte
 	PubKey [32]byte
 	Name   string
+
+	// SigningKey is the member's Ed25519 key. Only conversation lookups carry
+	// it, since the safety number of a direct chat covers it; group rosters
+	// leave it zero.
+	SigningKey [32]byte
 }
 
 // memberMinSize is what one member occupies on the wire with an empty name.
-const memberMinSize = IDSize + 32 + 2
+const memberMinSize = IDSize + 32 + 32 + 2
 
 // ConvInfo is the body of a CtrlConvInfoAck: everything a client needs to take
 // part in a conversation it has just heard of for the first time. Carrying the
@@ -314,6 +325,8 @@ func (c *ConvInfo) Encode() []byte {
 		offset += IDSize
 		copy(buf[offset:], m.PubKey[:])
 		offset += 32
+		copy(buf[offset:], m.SigningKey[:])
+		offset += 32
 		offset += putString(buf[offset:], m.Name)
 	}
 	return buf
@@ -354,13 +367,15 @@ func DecodeConvInfo(data []byte) (ConvInfo, error) {
 
 	c.Members = make([]ConvMember, 0, count)
 	for i := 0; i < count; i++ {
-		if len(data) < offset+IDSize+32 {
+		if len(data) < offset+IDSize+32+32 {
 			return c, fmt.Errorf("conv info truncated at member %d", i)
 		}
 		var m ConvMember
 		copy(m.UserID[:], data[offset:offset+IDSize])
 		offset += IDSize
 		copy(m.PubKey[:], data[offset:offset+32])
+		offset += 32
+		copy(m.SigningKey[:], data[offset:offset+32])
 		offset += 32
 
 		if m.Name, offset, err = getString(data, offset); err != nil {
@@ -398,4 +413,169 @@ func DecodeSignedURLPayload(data []byte, count int) ([]string, error) {
 		offset = next
 	}
 	return out, nil
+}
+
+// --- Prekey bundle and login ---
+
+// PreKeyBundle is the public key material the server keeps for each user and
+// hands to anyone opening a chat with them. The identity key is X25519 and
+// anchors the DH handshake; the signing key is Ed25519 and exists only to
+// vouch for the signed prekey, so a bundle can be checked for internal
+// consistency without trusting the server for it.
+type PreKeyBundle struct {
+	IdentityKey [32]byte
+	SigningKey  [32]byte
+	SPKID       uint32
+	SPK         [32]byte
+	SPKSig      [SignatureSize]byte
+}
+
+const PreKeyBundleSize = 32 + 32 + 4 + 32 + SignatureSize
+
+func (b *PreKeyBundle) Encode() []byte {
+	buf := make([]byte, PreKeyBundleSize)
+	offset := copy(buf, b.IdentityKey[:])
+	offset += copy(buf[offset:], b.SigningKey[:])
+	binary.BigEndian.PutUint32(buf[offset:], b.SPKID)
+	offset += 4
+	offset += copy(buf[offset:], b.SPK[:])
+	copy(buf[offset:], b.SPKSig[:])
+	return buf
+}
+
+// DecodePreKeyBundle reads a bundle from the front of data. Trailing bytes are
+// left for the caller, which is how a login body carries the username after it.
+func DecodePreKeyBundle(data []byte) (PreKeyBundle, error) {
+	var b PreKeyBundle
+	if len(data) < PreKeyBundleSize {
+		return b, fmt.Errorf("prekey bundle too short: %d", len(data))
+	}
+	offset := copy(b.IdentityKey[:], data)
+	offset += copy(b.SigningKey[:], data[offset:])
+	b.SPKID = binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	offset += copy(b.SPK[:], data[offset:])
+	copy(b.SPKSig[:], data[offset:])
+	return b, nil
+}
+
+// Verify reports whether the signed prekey really was signed by the bundle's
+// own signing key, and that no key in it is the all-zero placeholder.
+func (b *PreKeyBundle) Verify() bool {
+	if !IsValidKey(b.IdentityKey) || !IsValidKey(b.SigningKey) || !IsValidKey(b.SPK) {
+		return false
+	}
+	return VerifyPreKey(b.SigningKey, b.SPKID, b.SPK, b.SPKSig)
+}
+
+// EncodeLogin builds a CtrlLogin body: the bundle, then the username.
+func EncodeLogin(b *PreKeyBundle, username string) []byte {
+	return append(b.Encode(), username...)
+}
+
+func DecodeLogin(body []byte) (PreKeyBundle, string, error) {
+	b, err := DecodePreKeyBundle(body)
+	if err != nil {
+		return b, "", err
+	}
+	return b, string(body[PreKeyBundleSize:]), nil
+}
+
+// --- Ratchet header ---
+
+// RatchetVersion is carried in every direct-message header. A session built
+// under any other version is refused rather than guessed at.
+const RatchetVersion uint8 = 1
+
+const ratchetFlagInit uint8 = 1 << 0
+
+// RatchetInit is what the responder needs to build the session from a message
+// alone. It repeats on every message until the initiator hears back, so losing
+// the first packet does not strand the rest. The initiator's ephemeral key
+// travels here explicitly because the header's ratchet key moves on at each
+// rotation while the handshake still needs the original.
+type RatchetInit struct {
+	IdentityKey [32]byte // initiator's long-term X25519 key
+	Ephemeral   [32]byte // initiator's handshake ephemeral key
+	SPKID       uint32   // which of the responder's signed prekeys was used
+}
+
+// RatchetHeader precedes the ciphertext of a direct message. It is
+// authenticated as associated data but not encrypted.
+type RatchetHeader struct {
+	SenderEpoch   uint32   // epoch of the sender's current ratchet key
+	UsedPeerEpoch uint32   // which of the receiver's keys the sender's chain was built against
+	N             uint32   // index within the sender's current epoch
+	PrevLen       uint32   // how many messages the sender's previous epoch held
+	RatchetPub    [32]byte // sender's ratchet public key for SenderEpoch
+	Init          *RatchetInit
+}
+
+const (
+	ratchetHeaderLen = 1 + 1 + 4 + 4 + 4 + 4 + 32
+	ratchetInitLen   = 32 + 32 + 4
+)
+
+// Len is the encoded size, which differs with and without init.
+func (h *RatchetHeader) Len() int {
+	if h.Init != nil {
+		return ratchetHeaderLen + ratchetInitLen
+	}
+	return ratchetHeaderLen
+}
+
+func (h *RatchetHeader) Encode() []byte {
+	buf := make([]byte, 0, h.Len())
+	var flags uint8
+	if h.Init != nil {
+		flags |= ratchetFlagInit
+	}
+	buf = append(buf, RatchetVersion, flags)
+	buf = binary.BigEndian.AppendUint32(buf, h.SenderEpoch)
+	buf = binary.BigEndian.AppendUint32(buf, h.UsedPeerEpoch)
+	buf = binary.BigEndian.AppendUint32(buf, h.N)
+	buf = binary.BigEndian.AppendUint32(buf, h.PrevLen)
+	buf = append(buf, h.RatchetPub[:]...)
+	if h.Init != nil {
+		buf = append(buf, h.Init.IdentityKey[:]...)
+		buf = append(buf, h.Init.Ephemeral[:]...)
+		buf = binary.BigEndian.AppendUint32(buf, h.Init.SPKID)
+	}
+	return buf
+}
+
+// DecodeRatchetHeader reads a header from the front of data and returns it with
+// the number of bytes it occupied, so the caller can split off the ciphertext.
+func DecodeRatchetHeader(data []byte) (RatchetHeader, int, error) {
+	var h RatchetHeader
+	if len(data) < ratchetHeaderLen {
+		return h, 0, fmt.Errorf("ratchet header too short: %d", len(data))
+	}
+	if data[0] != RatchetVersion {
+		return h, 0, fmt.Errorf("unsupported ratchet version %d", data[0])
+	}
+	flags := data[1]
+	if flags&^ratchetFlagInit != 0 {
+		return h, 0, fmt.Errorf("unknown ratchet header flags %#x", flags)
+	}
+
+	h.SenderEpoch = binary.BigEndian.Uint32(data[2:])
+	h.UsedPeerEpoch = binary.BigEndian.Uint32(data[6:])
+	h.N = binary.BigEndian.Uint32(data[10:])
+	h.PrevLen = binary.BigEndian.Uint32(data[14:])
+	copy(h.RatchetPub[:], data[18:50])
+	offset := ratchetHeaderLen
+
+	if flags&ratchetFlagInit != 0 {
+		if len(data) < offset+ratchetInitLen {
+			return h, 0, fmt.Errorf("ratchet init fields truncated: %d", len(data))
+		}
+		init := &RatchetInit{}
+		copy(init.IdentityKey[:], data[offset:])
+		copy(init.Ephemeral[:], data[offset+32:])
+		init.SPKID = binary.BigEndian.Uint32(data[offset+64:])
+		h.Init = init
+		offset += ratchetInitLen
+	}
+	return h, offset, nil
 }

@@ -20,6 +20,7 @@ import (
 var (
 	mgr        *ClientManager
 	idMgr      *IdentityManager
+	stateStore *StateStore
 	sessionMgr *SessionManager
 	conn       net.Conn
 	reader     *bufio.Reader
@@ -41,6 +42,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to init identity: %v", err)
 	}
+	stateStore, err = OpenStateStore(StateDirName, idMgr.PublicKey)
+	if err != nil {
+		log.Fatalf("Failed to open state store: %v", err)
+	}
+	if err := idMgr.LoadPreKeys(stateStore); err != nil {
+		log.Fatalf("Failed to load prekeys: %v", err)
+	}
 
 	tuiPrint("Enter server address (default :8080): ")
 	addr, _ := reader.ReadString('\n')
@@ -59,7 +67,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	userID, err := performHandshake(username, idMgr.PublicKey)
+	userID, err := performHandshake(username)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,6 +75,9 @@ func main() {
 	mgr = NewClientManager(userID, username)
 	log.Printf("[DEBUG] main: mgr.UserID set to %x\n", mgr.UserID)
 	sessionMgr = NewSessionManager(idMgr, userID)
+	sessionMgr.KnownKey = mgr.GetPublicKey
+	sessionMgr.OnReplaced = discardHeld
+	restoreSessions()
 
 	go readLoop()
 
@@ -77,10 +88,12 @@ func main() {
 	}
 }
 
-func performHandshake(username string, pubKey [32]byte) ([16]byte, error) {
-	body := make([]byte, 0, 32+len(username))
-	body = append(body, pubKey[:]...)
-	body = append(body, []byte(username)...)
+// performHandshake logs in: it presents the prekey bundle, answers the server's
+// challenge with a signature from the identity signing key, and returns the user
+// ID the server assigns.
+func performHandshake(username string) ([16]byte, error) {
+	bundle := idMgr.Bundle()
+	body := common.EncodeLogin(&bundle, username)
 
 	pkt := common.Packet{
 		Header: common.Header{
@@ -93,11 +106,38 @@ func performHandshake(username string, pubKey [32]byte) ([16]byte, error) {
 		return [16]byte{}, err
 	}
 
+	challenge, err := common.Decode(conn)
+	if err != nil {
+		return [16]byte{}, err
+	}
+	if challenge.Header.MsgType == common.CtrlError {
+		return [16]byte{}, errors.New("login rejected by the server")
+	}
+	if challenge.Header.MsgType != common.CtrlLoginChallenge || len(challenge.Body) != common.LoginNonceSize {
+		return [16]byte{}, fmt.Errorf("unexpected login challenge: type %d", challenge.Header.MsgType)
+	}
+	var nonce [common.LoginNonceSize]byte
+	copy(nonce[:], challenge.Body)
+
+	sig := idMgr.SignLogin(nonce, username)
+	proof := common.Packet{
+		Header: common.Header{
+			MsgType: common.CtrlLoginProof,
+			BodyLen: common.SignatureSize,
+		},
+		Body: sig[:],
+	}
+	if err := sendPacket(&proof); err != nil {
+		return [16]byte{}, err
+	}
+
 	resp, err := common.Decode(conn)
 	if err != nil {
 		return [16]byte{}, err
 	}
-
+	if resp.Header.MsgType == common.CtrlError {
+		return [16]byte{}, errors.New("login rejected by the server")
+	}
 	if resp.Header.MsgType != common.CtrlLoginAck {
 		return [16]byte{}, fmt.Errorf("unexpected handshake response: %d", resp.Header.MsgType)
 	}
@@ -125,24 +165,57 @@ func readLoop() {
 // whose key has not arrived yet is held rather than dropped, and comes back
 // through here once the missing key lands.
 func deliver(pkt common.Packet) {
+	wasEncrypted := pkt.Header.Flags&common.FlagEncrypted != 0
+	convID := pkt.Header.ConversationID
+
 	if err := tryDecrypt(&pkt); err != nil {
 		if !Recoverable(err) {
 			log.Printf("[ERROR] Dropping packet from %x: %v", pkt.Header.SenderID[:4], err)
 			return
 		}
 
-		convID := pkt.Header.ConversationID
 		pending.Park(convID, pkt)
 
 		// A missing sender key is already on its way over the direct channel we
-		// share with that member, so there is nothing to ask for. Not knowing
+		// share with that member, and a missing epoch is waiting on a packet
+		// that is itself in flight, so there is nothing to ask for. Not knowing
 		// the conversation at all is different: the roster has to be fetched.
-		if !errors.Is(err, ErrNoSenderKey) {
+		if errors.Is(err, ErrNoSession) || errors.Is(err, ErrNoGroupSession) {
 			requestConvInfo(convID)
 		}
 		return
 	}
+
+	direct := wasEncrypted && !mgr.IsGroup(convID)
+	if direct {
+		learnDirectPeer(convID)
+	}
 	dispatch(pkt)
+
+	// Reading this message may have supplied what held ones were waiting for: the
+	// missing epoch of a direct chain, in particular, arrives as an ordinary packet.
+	if direct {
+		replay(pending.Release(convID))
+	}
+}
+
+// discardHeld drops packets parked for a conversation whose session was just
+// replaced. They belong to a session that no longer exists, so replaying them
+// could only park them again.
+func discardHeld(convID [16]byte) {
+	pending.Release(convID)
+}
+
+// learnDirectPeer registers a conversation first heard of through an incoming
+// message, which is how the responder side of a chat comes to exist: its session
+// was built from the message itself. The roster supplies the peer's name, checks
+// the identity key it claimed, and replaces this placeholder.
+func learnDirectPeer(convID [16]byte) {
+	if mgr.HasConversation(convID) {
+		return
+	}
+	mgr.RegisterConversation(convID, fmt.Sprintf("Private Chat: %x", convID[:4]), false)
+	requestConvInfo(convID)
 }
 
 // tryDecrypt unwraps an encrypted packet using whichever session applies.
@@ -204,27 +277,45 @@ func dispatch(pkt common.Packet) {
 			mgr.DeliverURL(pkt.Header.MessageID, strs)
 
 		case common.CtrlDirectAck:
-			// convID(16) || peerID(16) || peerPubKey(32) || peerName
-			if len(pkt.Body) < 64 {
+			// convID(16) || peerID(16) || prekey bundle || peerName
+			if len(pkt.Body) < 32+common.PreKeyBundleSize {
 				return
 			}
 			var convID, peerID [16]byte
 			copy(convID[:], pkt.Body[:16])
 			copy(peerID[:], pkt.Body[16:32])
-			var peerKey [32]byte
-			copy(peerKey[:], pkt.Body[32:64])
-			peerName := string(pkt.Body[64:])
+			bundle, err := common.DecodePreKeyBundle(pkt.Body[32:])
+			if err != nil {
+				return
+			}
+			peerName := string(pkt.Body[32+common.PreKeyBundleSize:])
 
 			mgr.AddUser(peerID, peerName)
+			mgr.UpdatePublicKey(peerID, bundle.IdentityKey)
 			mgr.RegisterConversation(convID, "Private Chat: "+peerName, false)
 
-			// No packet is sent back. The peer derives the mirror of this
-			// session on its own when our first message reaches it.
-			if err := sessionMgr.DeriveDirectSession(convID, peerID, peerKey); err != nil {
+			// No packet is sent back. The peer builds its side from the handshake
+			// fields in our first message, so it need not be online.
+			//
+			// An ack is only ever the answer to a /dm, and /dm on a chat that
+			// exists means start over. Only an ack we asked for does that, though:
+			// an unsolicited one must not be able to reset a working session.
+			res, err := sessionMgr.OpenDirectSession(convID, peerID, peerName, bundle, takeDMRequest(peerName))
+			if err != nil {
 				tuiPrintf("[ERROR] Could not open chat with %s: %v", peerName, err)
 				return
 			}
-			tuiPrintf("[INFO] Secure session ready with %s", peerName)
+			if res.Replaced {
+				discardHeld(convID)
+			}
+			if res.IdentityChanged {
+				tuiPrintf("[WARN] %s's identity key has changed since this chat began. Compare safety numbers before trusting it.", peerName)
+			}
+			if res.Replaced {
+				tuiPrintf("[INFO] Started a fresh secure session with %s. Messages either of you sent on the old one may not arrive.", peerName)
+			} else {
+				tuiPrintf("[INFO] Secure session ready with %s", peerName)
+			}
 
 		case common.CtrlSenderKey:
 			sk, err := common.DecodeSenderKey(pkt.Body)
@@ -411,11 +502,39 @@ func createGroup(name string, users []string) {
 	sendPacket(&pkt)
 }
 
+// dmRequests are the usernames the user has typed /dm for and not yet had
+// answered. The server's ack names the peer, so this is how an ack is recognised
+// as the answer to a request and not something unsolicited.
+var (
+	dmMu       sync.Mutex
+	dmRequests = map[string]struct{}{}
+)
+
+func noteDMRequest(name string) {
+	dmMu.Lock()
+	dmRequests[name] = struct{}{}
+	dmMu.Unlock()
+}
+
+// takeDMRequest reports whether the user asked for a chat with name, and
+// consumes the request.
+func takeDMRequest(name string) bool {
+	dmMu.Lock()
+	defer dmMu.Unlock()
+	_, ok := dmRequests[name]
+	delete(dmRequests, name)
+	return ok
+}
+
+// startPrivateChat asks the server for a private chat with name. If one already
+// exists, the answer starts a fresh secure session in its place, which is the
+// way out of a conversation that has stopped decrypting.
 func startPrivateChat(name string) {
 	if name == "" {
 		tuiPrintln("Target username cannot be empty")
 		return
 	}
+	noteDMRequest(name)
 	pkt := common.Packet{
 		Header: common.Header{
 			MsgType: common.CtrlDirectInit,
@@ -661,25 +780,76 @@ func applyConvInfo(info common.ConvInfo) {
 				continue
 			}
 			mgr.RegisterConversation(info.ConvID, "Private Chat: "+m.Name, false)
-			if err := sessionMgr.DeriveDirectSession(info.ConvID, m.UserID, m.PubKey); err != nil {
-				tuiPrintf("[ERROR] Could not open chat with %s: %v", m.Name, err)
+
+			// The session already exists if a message built it; what the roster
+			// adds is the peer's name and signing key, and an independent check of
+			// the identity key that message claimed.
+			if err := sessionMgr.NotePeerKeys(info.ConvID, m.UserID, m.Name, m.PubKey, m.SigningKey); err != nil {
+				if errors.Is(err, ErrPeerKeyMismatch) {
+					tuiPrintf("[ERROR] %s presented an identity key the server does not recognise. The chat was closed.", m.Name)
+				} else {
+					log.Printf("[ERROR] Could not record keys for %s: %v", m.Name, err)
+				}
 				return
 			}
-			tuiPrintf("[INFO] Secure session ready with %s", m.Name)
+			if _, ok := sessionMgr.GetSession(info.ConvID); ok {
+				tuiPrintf("[INFO] Secure session ready with %s", m.Name)
+				continue
+			}
+
+			// There is no session and the roster cannot make one: opening a chat
+			// takes the peer's prekey bundle, which only a CtrlDirectAck carries.
+			// This happens when this device lost its state, or closed the session
+			// over a key mismatch, while the peer still holds an established one.
+			// Whatever is held is unreadable, and replaying it would only park it
+			// again, so it is discarded and the user is told how to recover. A new
+			// chat from this side reaches the peer as a restart.
+			dropped := len(pending.Release(info.ConvID))
+			tuiPrintf("[WARN] %s is sending messages this device cannot read (%d held message(s) discarded). Run /dm %s to start a new secure session.",
+				m.Name, dropped, m.Name)
+			return
 		}
 	}
 
 	replay(pending.Release(info.ConvID))
 }
 
-// ensureDirectSession derives the session with a peer if there is not one yet.
+// ensureDirectSession is the group code's request for a direct channel with a
+// member, over which sender keys travel. A ratcheted direct session needs the
+// member's prekey bundle to open and the group roster does not carry one, so
+// there is nothing to derive here yet; group messaging stays disabled until the
+// roster does.
 func ensureDirectSession(peerID [16]byte, pubKey [32]byte) {
 	convID := common.HashIDs(mgr.UserID, peerID)
 	if _, ok := sessionMgr.GetSession(convID); ok {
 		return
 	}
-	if err := sessionMgr.DeriveDirectSession(convID, peerID, pubKey); err != nil {
-		log.Printf("[ERROR] Could not derive session with %x: %v", peerID[:4], err)
+	log.Printf("[WARN] no direct session with %x; group keys cannot be distributed to them", peerID[:4])
+}
+
+// restoreSessions brings back the direct conversations saved by earlier runs, so
+// a restart picks up each ratchet where it stopped instead of starting over.
+func restoreSessions() {
+	peers, err := sessionMgr.LoadSessions()
+	if err != nil {
+		log.Printf("[ERROR] Could not restore saved sessions: %v", err)
+	}
+	for _, p := range peers {
+		name := p.Name
+		if name == "" {
+			name = fmt.Sprintf("%x", p.ConversationID[:4])
+		}
+		mgr.AddUser(p.PeerID, name)
+		mgr.RegisterConversation(p.ConversationID, "Private Chat: "+name, false)
+
+		// A key learned only from a message header is not the directory's word, and
+		// must not come back out of KnownKey as if it were. The roster is asked for
+		// again; its answer confirms the key, supplies the name, and clears the flag.
+		if p.Unverified {
+			requestConvInfo(p.ConversationID)
+			continue
+		}
+		mgr.UpdatePublicKey(p.PeerID, p.IdentityKey)
 	}
 }
 

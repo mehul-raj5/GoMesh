@@ -140,6 +140,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if strings.HasPrefix(v, "/h") && !strings.HasPrefix(v, "/help") {
 				m.textarea.SetValue("/help")
 				m.textarea.CursorEnd()
+			} else if strings.HasPrefix(v, "/s") && !strings.HasPrefix(v, "/safety") {
+				m.textarea.SetValue("/safety")
 			} else if strings.HasPrefix(v, "/l") && !strings.HasPrefix(v, "/list") {
 				m.textarea.SetValue("/list")
 				m.textarea.CursorEnd()
@@ -410,6 +412,23 @@ func sendTextBubbleTea(convID [16]byte, text string) {
 	sendPacket(&pkt)
 }
 
+// showSafetyNumber prints the string two people compare out of band. It is the
+// only defence against a server that substituted a key, so it says what it is
+// for rather than leaving the number unexplained.
+func showSafetyNumber(convID [16]byte) {
+	if convID == [16]byte{} || mgr.IsGroup(convID) {
+		tuiPrintln("Usage: /safety (Requires an active private chat)")
+		return
+	}
+	number, err := sessionMgr.SafetyNumber(convID)
+	if err != nil {
+		tuiPrintf("Safety number unavailable: %v", err)
+		return
+	}
+	tuiPrintf("Safety number for %s:\n%s\nRead this to them over a channel you trust. If your two screens differ, someone is in the middle.",
+		mgr.GetConversationName(convID), number)
+}
+
 func tuiPrintf(format string, a ...any) {
 	if program != nil {
 		go program.Send(NetworkMsg{IsSystemMeta: true, Content: fmt.Sprintf(format, a...)})
@@ -444,7 +463,7 @@ func handleSlashCommand(input string, m *appModel) {
 
 	switch cmd {
 	case "help":
-		tuiPrintln("Commands:\n/help - Show this message\n/list - List conversations\n/chat <number> - Switch active chat\n/group <name> <user1,user2> - Create group\n/dm <username> - Start private chat\n/add <username> - Add user to current group\n/remove <username> - Remove user from group\n/admin <username> - Make user admin\n/remove_admin <username> - Remove admin\n/leave - Leave current group\n/file <path> - Send file to current chat")
+		tuiPrintln("Commands:\n/help - Show this message\n/list - List conversations\n/chat <number> - Switch active chat\n/group <name> <user1,user2> - Create group\n/dm <username> - Start private chat, or start a fresh secure session if one exists\n/add <username> - Add user to current group\n/remove <username> - Remove user from group\n/admin <username> - Make user admin\n/remove_admin <username> - Remove admin\n/leave - Leave current group\n/file <path> - Send file to current chat\n/safety - Show the safety number for the current private chat")
 	case "list":
 		listConversations()
 	case "chat":
@@ -525,6 +544,8 @@ func handleSlashCommand(input string, m *appModel) {
 		} else {
 			tuiPrintln("Usage: /leave (Requires active group)")
 		}
+	case "safety":
+		showSafetyNumber(m.activeConv)
 	case "file":
 		if m.activeConv != [16]byte{} && args != "" {
 			go sendMedia(m.activeConv, args)

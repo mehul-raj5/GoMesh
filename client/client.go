@@ -76,8 +76,10 @@ func main() {
 	log.Printf("[DEBUG] main: mgr.UserID set to %x\n", mgr.UserID)
 	sessionMgr = NewSessionManager(idMgr, userID)
 	sessionMgr.KnownKey = mgr.GetPublicKey
-	sessionMgr.OnReplaced = discardHeld
+	sessionMgr.OnReplaced = onSessionReplaced
+	sessionMgr.SigningPin = knownSigning
 	restoreSessions()
+	restoreGroups()
 
 	go readLoop()
 
@@ -174,7 +176,11 @@ func deliver(pkt common.Packet) {
 			return
 		}
 
-		pending.Park(convID, pkt)
+		if errors.Is(err, ErrNoGroupSession) || errors.Is(err, ErrNoSenderKey) || errors.Is(err, ErrMembershipBehind) {
+			pending.ParkFor(convID, pkt, GroupPendingTTL)
+		} else {
+			pending.Park(convID, pkt)
+		}
 
 		// A missing sender key is already on its way over the direct channel we
 		// share with that member, and a missing epoch is waiting on a packet
@@ -183,10 +189,16 @@ func deliver(pkt common.Packet) {
 		if errors.Is(err, ErrNoSession) || errors.Is(err, ErrNoGroupSession) {
 			requestConvInfo(convID)
 		}
+		// A message from a membership version we have not seen: fetch the log.
+		if errors.Is(err, ErrMembershipBehind) {
+			requestGroupLog(convID)
+		}
 		return
 	}
 
-	direct := wasEncrypted && !mgr.IsGroup(convID)
+	// A sender key arrives over a 1:1 session that exists for the group's sake, so
+	// it does not add a private chat to the list.
+	direct := wasEncrypted && !mgr.IsGroup(convID) && !sessionMgr.HasGroup(convID) && pkt.Header.MsgType != common.CtrlSenderKey
 	if direct {
 		learnDirectPeer(convID)
 	}
@@ -227,8 +239,16 @@ func tryDecrypt(pkt *common.Packet) error {
 	if pkt.Header.Flags&common.FlagEncrypted == 0 {
 		return nil
 	}
-	if mgr.IsGroup(pkt.Header.ConversationID) {
+	convID := pkt.Header.ConversationID
+	if mgr.IsGroup(convID) || sessionMgr.HasGroup(convID) {
 		return sessionMgr.DecryptGroupPacket(pkt)
+	}
+	// A group this client has not heard of yet looks like a direct chat. Its body
+	// says otherwise, and it is held until the group's log arrives.
+	if !mgr.HasConversation(convID) {
+		if w, err := common.DecodeGroupWire(pkt.Body); err == nil && w.Header.GroupID == convID {
+			return fmt.Errorf("%w: %x", ErrNoGroupSession, convID[:4])
+		}
 	}
 	return sessionMgr.DecryptPacket(pkt)
 }
@@ -307,6 +327,8 @@ func dispatch(pkt common.Packet) {
 			}
 			if res.Replaced {
 				discardHeld(convID)
+				// Starting over means whatever the peer held of our sender keys is gone.
+				sessionMgr.PeerKeysChanged(peerID)
 			}
 			if res.IdentityChanged {
 				tuiPrintf("[WARN] %s's identity key has changed since this chat began. Compare safety numbers before trusting it.", peerName)
@@ -318,151 +340,19 @@ func dispatch(pkt common.Packet) {
 			}
 
 		case common.CtrlSenderKey:
-			sk, err := common.DecodeSenderKey(pkt.Body)
-			if err != nil {
-				log.Printf("[ERROR] Bad sender key from %x: %v", pkt.Header.SenderID[:4], err)
-				return
-			}
+			handleSenderKey(pkt)
 
-			// Membership is not checked here. The server refuses to relay group
-			// traffic from a non-member, so a chain installed for one is inert,
-			// and a key can legitimately arrive before the roster that would
-			// confirm it.
-			if err := sessionMgr.SetPeerSenderKey(sk.GroupID, pkt.Header.SenderID, sk.ChainKey, sk.Epoch); err != nil {
-				log.Printf("[INFO] Ignoring sender key: %v", err)
-				return
-			}
-			replay(pending.ReleaseSender(sk.GroupID, pkt.Header.SenderID))
+		case common.CtrlGroupChange:
+			handleGroupChange(pkt)
 
-		case common.CtrlGroupCreate:
-			if len(pkt.Body) < 17 {
-				return
-			}
-			var convID [16]byte
-			copy(convID[:], pkt.Body[0:16])
-			nameLen := int(pkt.Body[16])
-			if len(pkt.Body) < 17+nameLen {
-				return
-			}
-			groupName := string(pkt.Body[17 : 17+nameLen])
+		case common.CtrlGroupHints:
+			handleGroupHints(pkt)
 
-			members, _, err := parseRoster(pkt.Body, 17+nameLen)
-			if err != nil {
-				log.Printf("[ERROR] Bad group roster for %x: %v", convID[:4], err)
-				return
-			}
+		case common.CtrlGroupChangeReject:
+			handleGroupReject(pkt)
 
-			mgr.RegisterConversation(convID, groupName, true)
-			for _, m := range members {
-				mgr.AddUser(m.UserID, m.Name)
-				mgr.UpdatePublicKey(m.UserID, m.PubKey)
-				mgr.AddMemberToGroup(convID, m.UserID)
-			}
-			mgr.SetGroupAdmin(convID, pkt.Header.SenderID, true)
-
-			tuiPrintf("[INFO] Group %s created with %d members. Distributing key...", groupName, len(members))
-			bootstrapGroupKeys(convID, members)
-
-		case common.CtrlGroupAdd:
-			// convID(16) || nameLen(1) || name || userID(16) || pubKey(32) || nameLen(1) || name
-			if len(pkt.Body) < 17 {
-				return
-			}
-			var convID [16]byte
-			copy(convID[:], pkt.Body[0:16])
-			nameLen := int(pkt.Body[16])
-			offset := 17
-			if len(pkt.Body) < offset+nameLen {
-				return
-			}
-			groupName := string(pkt.Body[offset : offset+nameLen])
-			offset += nameLen
-
-			if len(pkt.Body) < offset+16+32+1 {
-				return
-			}
-			var userID [16]byte
-			copy(userID[:], pkt.Body[offset:offset+16])
-			offset += 16
-			var pubKey [32]byte
-			copy(pubKey[:], pkt.Body[offset:offset+32])
-			offset += 32
-			uNameLen := int(pkt.Body[offset])
-			offset++
-			if len(pkt.Body) < offset+uNameLen {
-				return
-			}
-			userName := string(pkt.Body[offset : offset+uNameLen])
-
-			if mgr.GetConversationName(convID) == fmt.Sprintf("%x", convID[:4]) {
-				mgr.RegisterConversation(convID, groupName, true)
-			}
-			mgr.AddUser(userID, userName)
-			mgr.UpdatePublicKey(userID, pubKey)
-			mgr.AddMemberToGroup(convID, userID)
-			tuiPrintf("[INFO] User %s added to group %s", userName, groupName)
-
-			// The joiner needs a direct channel with us before any key can reach
-			// them, and the membership change means everyone rekeys.
-			ensureDirectSession(userID, pubKey)
-			distributeSenderKey(convID, mgr.GetGroupMembers(convID))
-
-		case common.CtrlGroupRemove:
-			if len(pkt.Body) < 32 {
-				return
-			}
-			var convID [16]byte
-			copy(convID[:], pkt.Body[0:16])
-			var userID [16]byte
-			copy(userID[:], pkt.Body[16:32])
-
-			uName := mgr.GetUsername(userID)
-			groupName := mgr.GetConversationName(convID)
-
-			if userID == mgr.UserID {
-				// We left, or were removed: forget the group and its keys.
-				mgr.RemoveConversation(convID)
-				sessionMgr.DeleteGroupSession(convID)
-				tuiPrintf("[INFO] You are no longer a member of %s", groupName)
-				return
-			}
-
-			mgr.RemoveMemberFromGroup(convID, userID)
-			tuiPrintf("[INFO] User %s removed from group %s", uName, groupName)
-
-			// Their chains are worthless to us now, and ours must become
-			// worthless to them: a chain ratchets forward on its own, so without
-			// a fresh key they would keep reading the group indefinitely.
-			sessionMgr.ForgetSender(convID, userID)
-			distributeSenderKey(convID, mgr.GetGroupMembers(convID))
-
-		case common.CtrlGroupMakeAdmin:
-			if len(pkt.Body) < 32 {
-				return
-			}
-			var convID [16]byte
-			copy(convID[:], pkt.Body[0:16])
-			var userID [16]byte
-			copy(userID[:], pkt.Body[16:32])
-
-			uName := mgr.GetUsername(userID)
-			groupName := mgr.GetConversationName(convID)
-			mgr.SetGroupAdmin(convID, userID, true)
-			tuiPrintf("[INFO] User %s is now an Admin of group %s", uName, groupName)
-
-		case common.CtrlGroupRemoveAdmin:
-			if len(pkt.Body) < 32 {
-				return
-			}
-			var convID [16]byte
-			copy(convID[:], pkt.Body[0:16])
-			var userID [16]byte
-			copy(userID[:], pkt.Body[16:32])
-
-			uName := mgr.GetUsername(userID)
-			groupName := mgr.GetConversationName(convID)
-			mgr.SetGroupAdmin(convID, userID, false)
-			tuiPrintf("[INFO] User %s is no longer an Admin of group %s", uName, groupName)
+		case common.CtrlUserLookupAck:
+			deliverLookup(pkt)
 
 		case common.CtrlConvInfoAck:
 			info, err := common.DecodeConvInfo(pkt.Body)
@@ -474,32 +364,6 @@ func dispatch(pkt common.Packet) {
 
 		}
 	}
-}
-
-func createGroup(name string, users []string) {
-	if name == "" {
-		tuiPrintln("Group Name cannot be empty")
-		return
-	}
-	body := make([]byte, 0)
-	body = append(body, byte(len(name)))
-	body = append(body, []byte(name)...)
-	body = append(body, byte(len(users)))
-
-	for _, u := range users {
-		u = strings.TrimSpace(u)
-		body = append(body, byte(len(u)))
-		body = append(body, []byte(u)...)
-	}
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupCreate,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
 }
 
 // dmRequests are the usernames the user has typed /dm for and not yet had
@@ -559,145 +423,6 @@ func listConversations() {
 	}
 }
 
-func addMember(convID [16]byte, username string) {
-	if !mgr.IsGroup(convID) {
-		tuiPrintln("Error: This is not a group.")
-		return
-	}
-	if !mgr.IsGroupAdmin(convID) {
-		tuiPrintln("Error: Only admins can perform this action.")
-		return
-	}
-	if username == "" {
-		return
-	}
-
-	body := make([]byte, 0)
-	body = append(body, convID[:]...)
-	body = append(body, byte(len(username)))
-	body = append(body, []byte(username)...)
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupAdd,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
-	tuiPrintln("Add member request sent.")
-}
-
-func removeMember(convID [16]byte, username string) {
-	if !mgr.IsGroup(convID) {
-		tuiPrintln("Error: This is not a group.")
-		return
-	}
-	if !mgr.IsGroupAdmin(convID) {
-		tuiPrintln("Error: Only admins can perform this action.")
-		return
-	}
-	if username == "" {
-		return
-	}
-
-	body := make([]byte, 0)
-	body = append(body, convID[:]...)
-	body = append(body, byte(len(username)))
-	body = append(body, []byte(username)...)
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupRemove,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
-	tuiPrintln("Remove member request sent.")
-}
-
-func makeGroupAdmin(convID [16]byte, username string) {
-	if !mgr.IsGroup(convID) {
-		tuiPrintln("Error: This is not a group.")
-		return
-	}
-	if !mgr.IsGroupAdmin(convID) {
-		tuiPrintln("Error: Only admins can perform this action.")
-		return
-	}
-	if username == "" {
-		return
-	}
-
-	body := make([]byte, 0)
-	body = append(body, convID[:]...)
-	body = append(body, byte(len(username)))
-	body = append(body, []byte(username)...)
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupMakeAdmin,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
-	tuiPrintln("Make admin request sent.")
-}
-
-func removeGroupAdmin(convID [16]byte, username string) {
-	if !mgr.IsGroup(convID) {
-		tuiPrintln("Error: This is not a group.")
-		return
-	}
-	if !mgr.IsGroupAdmin(convID) {
-		tuiPrintln("Error: Only admins can perform this action.")
-		return
-	}
-	if username == "" {
-		return
-	}
-
-	body := make([]byte, 0)
-	body = append(body, convID[:]...)
-	body = append(body, byte(len(username)))
-	body = append(body, []byte(username)...)
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupRemoveAdmin,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
-	tuiPrintln("Remove admin request sent.")
-}
-
-func leaveGroup(convID [16]byte) {
-	if !mgr.IsGroup(convID) {
-		tuiPrintln("Error: This is not a group.")
-		return
-	}
-
-	username := mgr.Username
-	body := make([]byte, 0)
-	body = append(body, convID[:]...)
-	body = append(body, byte(len(username)))
-	body = append(body, []byte(username)...)
-
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType: common.CtrlGroupRemove,
-			BodyLen: uint32(len(body)),
-		},
-		Body: body,
-	}
-	sendPacket(&pkt)
-	tuiPrintln("Leave group request sent.")
-}
-
 func genID() [16]byte {
 	var id [16]byte
 	rand.Read(id[:])
@@ -748,33 +473,32 @@ func requestConvInfo(convID [16]byte) {
 // applyConvInfo takes the server's answer about a conversation we did not know,
 // establishes whatever keys it makes possible, and replays what was held.
 func applyConvInfo(info common.ConvInfo) {
-	for _, m := range info.Members {
-		if m.UserID == mgr.UserID {
-			continue
+	if !info.IsGroup {
+		for _, m := range info.Members {
+			if m.UserID == mgr.UserID {
+				continue
+			}
+			mgr.AddUser(m.UserID, m.Name)
+			mgr.UpdatePublicKey(m.UserID, m.PubKey)
 		}
-		mgr.AddUser(m.UserID, m.Name)
-		mgr.UpdatePublicKey(m.UserID, m.PubKey)
 	}
 
 	if info.IsGroup {
+		// Who is in a group is what its signed log says, not what this roster says.
+		// The roster supplies the name and tells us the conversation is a group;
+		// the log, requested here, supplies the members.
 		name := info.Name
 		if name == "" {
 			name = fmt.Sprintf("%x", info.ConvID[:4])
 		}
-		mgr.RegisterConversation(info.ConvID, name, true)
-		sessionMgr.EnsureGroupSession(info.ConvID)
-
-		for _, m := range info.Members {
-			mgr.AddMemberToGroup(info.ConvID, m.UserID)
-			if m.UserID == mgr.UserID {
-				continue
-			}
-			// Sender keys travel over the direct channel with each member, so
-			// those sessions have to exist before any of them can be read.
-			ensureDirectSession(m.UserID, m.PubKey)
+		if !mgr.HasConversation(info.ConvID) || !mgr.IsGroup(info.ConvID) {
+			mgr.RegisterConversation(info.ConvID, name, true)
 		}
-		tuiPrintf("[INFO] Joined group %s (%d members)", name, len(info.Members))
-	} else {
+		requestGroupLog(info.ConvID)
+		return
+	}
+
+	{
 		for _, m := range info.Members {
 			if m.UserID == mgr.UserID {
 				continue
@@ -814,19 +538,6 @@ func applyConvInfo(info common.ConvInfo) {
 	replay(pending.Release(info.ConvID))
 }
 
-// ensureDirectSession is the group code's request for a direct channel with a
-// member, over which sender keys travel. A ratcheted direct session needs the
-// member's prekey bundle to open and the group roster does not carry one, so
-// there is nothing to derive here yet; group messaging stays disabled until the
-// roster does.
-func ensureDirectSession(peerID [16]byte, pubKey [32]byte) {
-	convID := common.HashIDs(mgr.UserID, peerID)
-	if _, ok := sessionMgr.GetSession(convID); ok {
-		return
-	}
-	log.Printf("[WARN] no direct session with %x; group keys cannot be distributed to them", peerID[:4])
-}
-
 // restoreSessions brings back the direct conversations saved by earlier runs, so
 // a restart picks up each ratchet where it stopped instead of starting over.
 func restoreSessions() {
@@ -859,115 +570,4 @@ func replay(pkts []common.Packet) {
 	for _, p := range pkts {
 		deliver(p)
 	}
-}
-
-// parseRoster reads the member list the server appends to group broadcasts:
-// count(1) then, per member, id(16) ‖ identityKey(32) ‖ nameLen(1) ‖ name.
-func parseRoster(body []byte, offset int) ([]common.ConvMember, int, error) {
-	if len(body) < offset+1 {
-		return nil, offset, fmt.Errorf("roster truncated before member count")
-	}
-	count := int(body[offset])
-	offset++
-
-	members := make([]common.ConvMember, 0, count)
-	for i := 0; i < count; i++ {
-		if len(body) < offset+16+32+1 {
-			return nil, offset, fmt.Errorf("roster truncated at member %d", i)
-		}
-		var m common.ConvMember
-		copy(m.UserID[:], body[offset:offset+16])
-		offset += 16
-		copy(m.PubKey[:], body[offset:offset+32])
-		offset += 32
-
-		nameLen := int(body[offset])
-		offset++
-		if len(body) < offset+nameLen {
-			return nil, offset, fmt.Errorf("roster truncated in member %d name", i)
-		}
-		m.Name = string(body[offset : offset+nameLen])
-		offset += nameLen
-
-		members = append(members, m)
-	}
-	return members, offset, nil
-}
-
-// bootstrapGroupKeys sets up everything this client needs to take part in a
-// group: a direct session with every other member, its own sending chain, and
-// that chain delivered to each of them.
-//
-// No round trip is needed for the sessions. The identity keys arrived with the
-// roster, and the server registered the pairwise conversations when it created
-// the group, so the key packets have somewhere to go immediately.
-func bootstrapGroupKeys(groupID [16]byte, members []common.ConvMember) {
-	sessionMgr.EnsureGroupSession(groupID)
-
-	ids := make([][16]byte, 0, len(members))
-	for _, m := range members {
-		if m.UserID == mgr.UserID {
-			continue
-		}
-		ensureDirectSession(m.UserID, m.PubKey)
-		ids = append(ids, m.UserID)
-	}
-	distributeSenderKey(groupID, ids)
-}
-
-// distributeSenderKey generates a fresh sending chain for a group and unicasts
-// it to every current member over the direct channel shared with each. Called
-// when the group is first keyed and again on every membership change.
-func distributeSenderKey(groupID [16]byte, memberIDs [][16]byte) {
-	// Only the key RotateSenderKey returns may be sent. The live chain ratchets
-	// forward with every message, so reading it back later would hand peers a
-	// key that cannot open anything already sent in this epoch.
-	key, epoch, err := sessionMgr.RotateSenderKey(groupID)
-	if err != nil {
-		tuiPrintf("[ERROR] Could not generate a sender key: %v", err)
-		return
-	}
-	payload := (&common.SenderKeyPayload{GroupID: groupID, Epoch: epoch, ChainKey: key}).Encode()
-
-	sent, failed := 0, 0
-	for _, id := range memberIDs {
-		if id == mgr.UserID {
-			continue
-		}
-		if sendSenderKey(id, payload) {
-			sent++
-		} else {
-			failed++
-		}
-	}
-
-	if failed > 0 {
-		tuiPrintf("[WARN] Sent group key v%d to %d members, %d could not be reached", epoch, sent, failed)
-		return
-	}
-	log.Printf("[DEBUG] distributeSenderKey: group %x epoch %d to %d members", groupID[:4], epoch, sent)
-}
-
-// sendSenderKey delivers one chain key to one member, encrypted to them alone
-// over the direct conversation the two share.
-func sendSenderKey(peerID [16]byte, payload []byte) bool {
-	pkt := common.Packet{
-		Header: common.Header{
-			MsgType:        common.CtrlSenderKey,
-			ConversationID: common.HashIDs(mgr.UserID, peerID),
-			MessageID:      genID(),
-			SenderID:       mgr.UserID,
-			BodyLen:        uint32(len(payload)),
-		},
-		Body: payload,
-	}
-	if err := sessionMgr.EncryptPacket(&pkt); err != nil {
-		log.Printf("[ERROR] Could not seal sender key for %x: %v", peerID[:4], err)
-		return false
-	}
-	if err := sendPacket(&pkt); err != nil {
-		log.Printf("[ERROR] Could not send sender key to %x: %v", peerID[:4], err)
-		return false
-	}
-	return true
 }

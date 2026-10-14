@@ -14,23 +14,31 @@ const (
 	MsgText      uint8 = 0x01
 	MsgMediaMeta uint8 = 0x04 // E2E-encrypted media metadata envelope (Supabase direct-upload)
 
-	CtrlLogin       uint8 = 0x10
-	CtrlLoginAck    uint8 = 0x11
-	CtrlGroupCreate uint8 = 0x12
-	CtrlGroupAdd    uint8 = 0x13
-	CtrlGroupRemove uint8 = 0x14
-	CtrlDirectInit  uint8 = 0x15
-	CtrlDirectAck   uint8 = 0x16
+	CtrlLogin      uint8 = 0x10
+	CtrlLoginAck   uint8 = 0x11
+	CtrlDirectInit uint8 = 0x15
+	CtrlDirectAck  uint8 = 0x16
+
+	// Group membership is a signed log the server orders and every client
+	// verifies. A client submits a signed change (CtrlGroupCreate for the first,
+	// CtrlGroupChange for the rest); the server answers the submitter with a
+	// CtrlGroupChangeReject if it cannot take it and otherwise broadcasts the
+	// accepted change to the members as a CtrlGroupChange.
+	CtrlGroupCreate       uint8 = 0x12
+	CtrlGroupChange       uint8 = 0x13
+	CtrlGroupChangeReject uint8 = 0x14
 	// Login is a three-step exchange: CtrlLogin names the account, the server
 	// answers with a random challenge, and the client proves it holds the
 	// account's signing key by signing it. Without the proof a public bundle,
 	// which the server hands to anyone, would be enough to log in as its owner.
-	CtrlLoginChallenge   uint8 = 0x17 // server -> client: body is a LoginNonceSize nonce
-	CtrlLoginProof       uint8 = 0x18 // client -> server: body is a signature over the nonce
-	CtrlGroupMakeAdmin   uint8 = 0x1B
-	CtrlGroupRemoveAdmin uint8 = 0x1C
+	CtrlLoginChallenge uint8 = 0x17 // server -> client: body is a LoginNonceSize nonce
+	CtrlLoginProof     uint8 = 0x18 // client -> server: body is a signature over the nonce
+	// CtrlGroupLogRq asks for the changes after a version; the server answers
+	// with those as CtrlGroupChange packets and then a CtrlGroupHints.
+	CtrlGroupLogRq uint8 = 0x1B
+	CtrlGroupHints uint8 = 0x1C
 	// Sender-key group messaging: every member generates their own sending
-	// chain and hands it to each other member over the 1-1 channel they share,
+	// key and hands it to each other member over the 1-1 channel they share,
 	// so a CtrlSenderKey packet is always carried inside an encrypted unicast.
 	CtrlSenderKey uint8 = 0x1D
 
@@ -45,6 +53,11 @@ const (
 	CtrlUploadAck   uint8 = 0x21 // server -> client: signed upload URL + object path
 	CtrlDownloadRq  uint8 = 0x22 // client -> server: request a signed download URL
 	CtrlDownloadAck uint8 = 0x23 // server -> client: signed download URL
+
+	// Username lookup: who a name is and the bundle to open a session with them.
+	// Needed to sign a membership change that names someone by ID and keys.
+	CtrlUserLookupRq  uint8 = 0x24 // client -> server: body is the username
+	CtrlUserLookupAck uint8 = 0x25 // server -> client: an encoded UserLookup, or empty
 
 	CtrlError uint8 = 0xFF
 
@@ -230,39 +243,6 @@ func DecodeMediaMetadata(data []byte) (MediaMetadata, error) {
 	copy(m.Thumbnail, data[offset:offset+thumbLen])
 
 	return m, nil
-}
-
-// --- Sender-key distribution ---
-
-// SenderKeyPayload is the body of a CtrlSenderKey packet: one member's sending
-// chain key for one group, at one epoch. Every membership change bumps the
-// epoch and every member redistributes, so a receiver can tell a fresh key from
-// a replayed older one.
-type SenderKeyPayload struct {
-	GroupID  [IDSize]byte
-	Epoch    uint32
-	ChainKey [32]byte
-}
-
-const senderKeyLen = IDSize + 4 + 32
-
-func (s *SenderKeyPayload) Encode() []byte {
-	buf := make([]byte, senderKeyLen)
-	copy(buf[0:IDSize], s.GroupID[:])
-	binary.BigEndian.PutUint32(buf[IDSize:], s.Epoch)
-	copy(buf[IDSize+4:], s.ChainKey[:])
-	return buf
-}
-
-func DecodeSenderKey(data []byte) (SenderKeyPayload, error) {
-	var s SenderKeyPayload
-	if len(data) < senderKeyLen {
-		return s, fmt.Errorf("sender key payload too short: %d", len(data))
-	}
-	copy(s.GroupID[:], data[0:IDSize])
-	s.Epoch = binary.BigEndian.Uint32(data[IDSize:])
-	copy(s.ChainKey[:], data[IDSize+4:])
-	return s, nil
 }
 
 // --- Conversation lookup ---

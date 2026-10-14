@@ -220,3 +220,20 @@ func (m *ClientManager) UpdatePublicKey(userID [common.IDSize]byte, key [32]byte
 	defer m.mu.Unlock()
 	m.PublicKeys[userID] = key
 }
+
+// SetGroupRoster replaces a group's displayed members and admins with the ones the
+// signed log defines.
+func (m *ClientManager) SetGroupRoster(id [common.IDSize]byte, members, admins [][common.IDSize]byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info, ok := m.Conversations[id]
+	if !ok {
+		return
+	}
+	info.Members = append([][common.IDSize]byte(nil), members...)
+	info.Admins = make(map[[common.IDSize]byte]struct{}, len(admins))
+	for _, a := range admins {
+		info.Admins[a] = struct{}{}
+	}
+	m.Conversations[id] = info
+}

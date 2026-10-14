@@ -82,9 +82,17 @@ func (c *Client) close() {
 type Conversation struct {
 	ID      [common.IDSize]byte
 	Name    string
-	Admins  map[[common.IDSize]byte]struct{}
 	Members [][common.IDSize]byte
 	IsGroup bool
+
+	// Membership and Log are the group's signed history. The server orders
+	// changes and refuses invalid ones, but clients verify them again, so a
+	// compromised server cannot add itself. Members mirrors Membership. Both are
+	// guarded by Server.mu, and changeMu serializes submissions to one group so
+	// that its broadcasts leave in log order.
+	Membership common.Membership
+	Log        []common.SignedChange
+	changeMu   sync.Mutex
 }
 
 func (c *Conversation) HasMember(id [common.IDSize]byte) bool {
@@ -271,14 +279,12 @@ func (s *Server) handlePacket(sender *Client, p common.Packet) {
 	switch p.Header.MsgType {
 	case common.CtrlGroupCreate:
 		s.handleGroupCreate(sender, p)
-	case common.CtrlGroupAdd:
-		s.handleGroupAdd(sender, p)
-	case common.CtrlGroupRemove:
-		s.handleGroupRemove(sender, p)
-	case common.CtrlGroupMakeAdmin:
-		s.handleGroupMakeAdmin(sender, p)
-	case common.CtrlGroupRemoveAdmin:
-		s.handleGroupRemoveAdmin(sender, p)
+	case common.CtrlGroupChange:
+		s.handleGroupChange(sender, p)
+	case common.CtrlGroupLogRq:
+		s.handleGroupLogRq(sender, p)
+	case common.CtrlUserLookupRq:
+		s.handleUserLookup(sender, p)
 	case common.CtrlDirectInit:
 		s.handleDirectInit(sender, p)
 	case common.CtrlConvInfoRq:
@@ -293,349 +299,6 @@ func (s *Server) handlePacket(sender *Client, p common.Packet) {
 		s.handleData(sender, p)
 	default:
 		log.Printf("Unknown MsgType: %d", p.Header.MsgType)
-	}
-}
-
-func (s *Server) handleGroupAdd(sender *Client, p common.Packet) {
-	if len(p.Body) < 17 {
-		return
-	}
-	var convID [16]byte
-	copy(convID[:], p.Body[:16])
-
-	s.mu.Lock()
-	conv, ok := s.convs[convID]
-	s.mu.Unlock()
-
-	if !ok {
-		return
-	}
-
-	s.mu.RLock()
-	_, isAdmin := conv.Admins[sender.UserID]
-	s.mu.RUnlock()
-
-	if !isAdmin {
-		log.Printf("[WARNING] Unauthorized CtrlGroupAdd from %x for group %x", sender.UserID[:4], convID[:4])
-		return
-	}
-
-	offset := 16
-	uLen := int(p.Body[offset])
-	offset++
-	if len(p.Body) < offset+uLen {
-		return
-	}
-	targetName := string(p.Body[offset : offset+uLen])
-
-	s.mu.RLock()
-	targetID, idExists := s.usernames[targetName]
-	var targetUser *User
-	if idExists {
-		targetUser = s.users[targetID]
-	}
-	s.mu.RUnlock()
-
-	if !idExists || targetUser.IdentityKey == [32]byte{} {
-		log.Printf("[WARNING] Cannot add unregistered user %s to group", targetName)
-		return
-	}
-
-	s.mu.Lock()
-	if conv.HasMember(targetID) {
-		s.mu.Unlock()
-		return
-	}
-	conv.Members = append(conv.Members, targetID)
-	s.ensurePairwiseConvsLocked(conv.Members)
-	s.mu.Unlock()
-
-	respBody := make([]byte, 0)
-	respBody = append(respBody, convID[:]...)
-	respBody = append(respBody, byte(len(conv.Name)))
-	respBody = append(respBody, []byte(conv.Name)...)
-	respBody = append(respBody, targetID[:]...)
-	respBody = append(respBody, targetUser.IdentityKey[:]...)
-	respBody = append(respBody, byte(len(targetName)))
-	respBody = append(respBody, []byte(targetName)...)
-
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:        common.CtrlGroupAdd,
-			ConversationID: convID,
-			SenderID:       sender.UserID,
-			BodyLen:        uint32(len(respBody)),
-		},
-		Body: respBody,
-	}
-
-	syncBody := make([]byte, 0)
-	syncBody = append(syncBody, convID[:]...)
-	syncBody = append(syncBody, byte(len(conv.Name)))
-	syncBody = append(syncBody, []byte(conv.Name)...)
-
-	s.mu.RLock()
-	syncBody = s.appendRosterLocked(syncBody, conv.Members)
-	var adminsList [][16]byte
-	for aID := range conv.Admins {
-		if aID != sender.UserID {
-			adminsList = append(adminsList, aID)
-		}
-	}
-	members := make([][16]byte, 0, len(conv.Members))
-	members = append(members, conv.Members...)
-	s.mu.RUnlock()
-
-	syncResp := common.Packet{
-		Header: common.Header{
-			MsgType:        common.CtrlGroupCreate,
-			ConversationID: convID,
-			SenderID:       sender.UserID,
-			BodyLen:        uint32(len(syncBody)),
-		},
-		Body: syncBody,
-	}
-
-	for _, m := range members {
-		if m == targetID {
-			s.sendPacket(m, syncResp)
-
-			for _, aID := range adminsList {
-				adminRespBody := make([]byte, 32)
-				copy(adminRespBody[0:16], convID[:])
-				copy(adminRespBody[16:32], aID[:])
-
-				aResp := common.Packet{
-					Header: common.Header{
-						MsgType:  common.CtrlGroupMakeAdmin,
-						SenderID: sender.UserID,
-						BodyLen:  32,
-					},
-					Body: adminRespBody,
-				}
-				s.sendPacket(targetID, aResp)
-			}
-		} else {
-			s.sendPacket(m, resp)
-		}
-	}
-}
-
-func (s *Server) handleGroupRemove(sender *Client, p common.Packet) {
-	if len(p.Body) < 17 {
-		return
-	}
-	var convID [16]byte
-	copy(convID[:], p.Body[:16])
-
-	s.mu.RLock()
-	conv, ok := s.convs[convID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	_, isAdmin := conv.Admins[sender.UserID]
-	isMember := conv.HasMember(sender.UserID)
-	s.mu.RUnlock()
-
-	if !isMember {
-		log.Printf("[WARNING] CtrlGroupRemove from non-member %x for group %x", sender.UserID[:4], convID[:4])
-		return
-	}
-
-	offset := 16
-	uLen := int(p.Body[offset])
-	offset++
-	if len(p.Body) < offset+uLen {
-		return
-	}
-	targetName := string(p.Body[offset : offset+uLen])
-	targetID, ok := s.getUserIDByName(targetName)
-	if !ok {
-		return
-	}
-
-	// The initiator is sender.UserID, which the server stamps on every packet,
-	// so it cannot be spoofed by the client. A member may always remove
-	// themselves (leaving the group); removing anyone else requires admin.
-	if targetID != sender.UserID && !isAdmin {
-		log.Printf("[WARNING] Unauthorized CtrlGroupRemove from %x targeting %x in group %x",
-			sender.UserID[:4], targetID[:4], convID[:4])
-		return
-	}
-
-	s.mu.Lock()
-	if c, ok := s.convs[convID]; ok {
-		c.RemoveMember(targetID)
-		wasAdmin := false
-		if _, ok := c.Admins[targetID]; ok {
-			delete(c.Admins, targetID)
-			wasAdmin = true
-		}
-		if wasAdmin && len(c.Admins) == 0 && len(c.Members) > 0 {
-			newAdmin := c.Members[0]
-			c.Admins[newAdmin] = struct{}{}
-			go s.broadcastMakeAdmin(convID, newAdmin)
-		}
-	}
-	s.mu.Unlock()
-
-	respBody := make([]byte, 0)
-	respBody = append(respBody, convID[:]...)
-	respBody = append(respBody, targetID[:]...)
-
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:  common.CtrlGroupRemove,
-			SenderID: sender.UserID,
-			BodyLen:  uint32(len(respBody)),
-		},
-		Body: respBody,
-	}
-
-	s.mu.RLock()
-	members := make([][16]byte, 0, len(conv.Members))
-	members = append(members, conv.Members...)
-	s.mu.RUnlock()
-
-	for _, m := range members {
-		s.sendPacket(m, resp)
-	}
-	s.sendPacket(targetID, resp)
-}
-
-func (s *Server) handleGroupMakeAdmin(sender *Client, p common.Packet) {
-	if len(p.Body) < 17 {
-		return
-	}
-	var convID [16]byte
-	copy(convID[:], p.Body[:16])
-
-	s.mu.RLock()
-	conv, ok := s.convs[convID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	_, isAdmin := conv.Admins[sender.UserID]
-	s.mu.RUnlock()
-
-	if !isAdmin {
-		log.Printf("[WARNING] Unauthorized MakeAdmin from %x for group %x", sender.UserID[:4], convID[:4])
-		return
-	}
-
-	offset := 16
-	uLen := int(p.Body[offset])
-	offset++
-	if len(p.Body) < offset+uLen {
-		return
-	}
-	targetName := string(p.Body[offset : offset+uLen])
-	targetID, ok := s.getUserIDByName(targetName)
-	if !ok {
-		return
-	}
-
-	s.mu.Lock()
-	if !conv.HasMember(targetID) {
-		s.mu.Unlock()
-		return
-	}
-	conv.Admins[targetID] = struct{}{}
-	s.mu.Unlock()
-
-	respBody := make([]byte, 16+16)
-	copy(respBody[0:16], convID[:])
-	copy(respBody[16:32], targetID[:])
-
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:  common.CtrlGroupMakeAdmin,
-			SenderID: sender.UserID,
-			BodyLen:  uint32(len(respBody)),
-		},
-		Body: respBody,
-	}
-
-	s.mu.RLock()
-	members := make([][16]byte, 0, len(conv.Members))
-	members = append(members, conv.Members...)
-	s.mu.RUnlock()
-
-	for _, m := range members {
-		s.sendPacket(m, resp)
-	}
-}
-
-func (s *Server) handleGroupRemoveAdmin(sender *Client, p common.Packet) {
-	if len(p.Body) < 17 {
-		return
-	}
-	var convID [16]byte
-	copy(convID[:], p.Body[:16])
-
-	s.mu.RLock()
-	conv, ok := s.convs[convID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	_, isAdmin := conv.Admins[sender.UserID]
-	s.mu.RUnlock()
-
-	if !isAdmin {
-		log.Printf("[WARNING] Unauthorized RemoveAdmin from %x for group %x", sender.UserID[:4], convID[:4])
-		return
-	}
-
-	offset := 16
-	uLen := int(p.Body[offset])
-	offset++
-	if len(p.Body) < offset+uLen {
-		return
-	}
-	targetName := string(p.Body[offset : offset+uLen])
-	targetID, ok := s.getUserIDByName(targetName)
-	if !ok {
-		return
-	}
-
-	// Checked and mutated in one critical section so two concurrent demotions
-	// cannot both pass the last-admin guard and leave the group unmanageable.
-	s.mu.Lock()
-	if _, isTargetAdmin := conv.Admins[targetID]; !isTargetAdmin {
-		s.mu.Unlock()
-		return
-	}
-	if len(conv.Admins) <= 1 {
-		s.mu.Unlock()
-		log.Printf("[WARNING] Refusing to demote %x: last admin of group %x", targetID[:4], convID[:4])
-		return
-	}
-	delete(conv.Admins, targetID)
-	s.mu.Unlock()
-
-	respBody := make([]byte, 16+16)
-	copy(respBody[0:16], convID[:])
-	copy(respBody[16:32], targetID[:])
-
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:  common.CtrlGroupRemoveAdmin,
-			SenderID: sender.UserID,
-			BodyLen:  uint32(len(respBody)),
-		},
-		Body: respBody,
-	}
-
-	s.mu.RLock()
-	members := make([][16]byte, 0, len(conv.Members))
-	members = append(members, conv.Members...)
-	s.mu.RUnlock()
-
-	for _, m := range members {
-		s.sendPacket(m, resp)
 	}
 }
 
@@ -660,6 +323,13 @@ func (s *Server) handleData(sender *Client, p common.Packet) {
 		return
 	}
 
+	// A sender key is addressed to one person, so it is only relayed over a
+	// two-party conversation and never fanned out to a group.
+	if p.Header.MsgType == common.CtrlSenderKey && conv.IsGroup {
+		log.Printf("[WARNING] handleData: sender key sent to group %x by %x", p.Header.ConversationID[:4], sender.UserID[:4])
+		return
+	}
+
 	// members is a snapshot taken under the read lock; enqueue never blocks, so
 	// the fan-out runs inline rather than spawning a goroutine per recipient.
 	for _, memberID := range members {
@@ -668,122 +338,6 @@ func (s *Server) handleData(sender *Client, p common.Packet) {
 		}
 		s.sendPacket(memberID, p)
 	}
-}
-
-func (s *Server) handleGroupCreate(sender *Client, p common.Packet) {
-	if len(p.Body) < 1 {
-		return
-	}
-	offset := 0
-	nameLen := int(p.Body[offset])
-	offset++
-	if len(p.Body) < offset+nameLen+1 {
-		return
-	}
-	groupName := string(p.Body[offset : offset+nameLen])
-	offset += nameLen
-
-	count := int(p.Body[offset])
-	offset++
-
-	memberIDs := make([][16]byte, 0)
-	memberIDs = append(memberIDs, sender.UserID)
-
-	for i := 0; i < count; i++ {
-		if len(p.Body) < offset+1 {
-			break
-		}
-		uLen := int(p.Body[offset])
-		offset++
-		if len(p.Body) < offset+uLen {
-			break
-		}
-		uName := string(p.Body[offset : offset+uLen])
-		offset += uLen
-
-		s.mu.RLock()
-		uid, idExists := s.usernames[uName]
-		var user *User
-		if idExists {
-			user = s.users[uid]
-		}
-		s.mu.RUnlock()
-
-		if !idExists || user.IdentityKey == [32]byte{} {
-			log.Printf("[WARNING] Skipping unregistered user %s during group create", uName)
-			continue
-		}
-
-		memberIDs = append(memberIDs, uid)
-	}
-
-	convID := genID()
-	conv := &Conversation{
-		ID:      convID,
-		Name:    groupName,
-		IsGroup: true,
-		Admins:  make(map[[common.IDSize]byte]struct{}),
-		Members: make([][common.IDSize]byte, 0),
-	}
-	for _, mid := range memberIDs {
-		if !conv.HasMember(mid) {
-			conv.Members = append(conv.Members, mid)
-		}
-	}
-	conv.Admins[sender.UserID] = struct{}{}
-
-	s.mu.Lock()
-	s.convs[convID] = conv
-	s.ensurePairwiseConvsLocked(conv.Members)
-	s.mu.Unlock()
-
-	respBody := make([]byte, 0)
-	respBody = append(respBody, convID[:]...)
-	respBody = append(respBody, byte(len(groupName)))
-	respBody = append(respBody, []byte(groupName)...)
-
-	s.mu.RLock()
-	respBody = s.appendRosterLocked(respBody, conv.Members)
-	s.mu.RUnlock()
-
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:        common.CtrlGroupCreate,
-			ConversationID: convID,
-			SenderID:       sender.UserID,
-			BodyLen:        uint32(len(respBody)),
-		},
-		Body: respBody,
-	}
-
-	for _, mID := range conv.Members {
-		s.sendPacket(mID, resp)
-	}
-}
-
-// appendRosterLocked writes a member list in the group-broadcast format:
-// count(1), then per member id(16) ‖ identityKey(32) ‖ nameLen(1) ‖ name.
-//
-// The identity keys ride along so that a client receiving the broadcast can
-// derive a direct session with every other member on the spot, rather than
-// paying a lookup round trip per peer before it can hand out its sender key.
-//
-// Caller must hold at least s.mu.RLock.
-func (s *Server) appendRosterLocked(buf []byte, members [][common.IDSize]byte) []byte {
-	buf = append(buf, byte(len(members)))
-	for _, mID := range members {
-		name := "Unknown"
-		var key [32]byte
-		if u, ok := s.users[mID]; ok {
-			name = u.Username
-			key = u.IdentityKey
-		}
-		buf = append(buf, mID[:]...)
-		buf = append(buf, key[:]...)
-		buf = append(buf, byte(len(name)))
-		buf = append(buf, []byte(name)...)
-	}
-	return buf
 }
 
 // ensurePairwiseConvsLocked registers the 1-1 conversation between every pair of
@@ -803,7 +357,6 @@ func (s *Server) ensurePairwiseConvsLocked(members [][common.IDSize]byte) {
 			s.convs[convID] = &Conversation{
 				ID:      convID,
 				Members: [][common.IDSize]byte{members[i], members[j]},
-				Admins:  make(map[[common.IDSize]byte]struct{}),
 				IsGroup: false,
 			}
 		}
@@ -835,7 +388,6 @@ func (s *Server) handleDirectInit(sender *Client, p common.Packet) {
 		conv := &Conversation{
 			ID:      convID,
 			Members: make([][common.IDSize]byte, 0),
-			Admins:  make(map[[common.IDSize]byte]struct{}),
 			IsGroup: false,
 		}
 		conv.Members = append(conv.Members, sender.UserID)
@@ -1192,32 +744,6 @@ func genID() [16]byte {
 		panic(err)
 	}
 	return id
-}
-
-func (s *Server) broadcastMakeAdmin(convID, targetID [common.IDSize]byte) {
-	respBody := make([]byte, 32)
-	copy(respBody[0:16], convID[:])
-	copy(respBody[16:32], targetID[:])
-	resp := common.Packet{
-		Header: common.Header{
-			MsgType:  common.CtrlGroupMakeAdmin,
-			SenderID: [16]byte{},
-			BodyLen:  32,
-		},
-		Body: respBody,
-	}
-	s.mu.RLock()
-	conv, ok := s.convs[convID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	members := make([][16]byte, 0, len(conv.Members))
-	members = append(members, conv.Members...)
-	s.mu.RUnlock()
-	for _, m := range members {
-		s.sendPacket(m, resp)
-	}
 }
 
 func main() {

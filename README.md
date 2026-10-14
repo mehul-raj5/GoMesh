@@ -1,8 +1,7 @@
 # GoMesh: Comprehensive Project Documentation
 
 `GoMesh` is a secure messaging application supporting end-to-end encrypted (E2EE) private
-chats and file transfers over a custom TCP protocol. Group messaging exists in the code but
-is currently paused (see *Known limitations*).
+chats, end-to-end encrypted group chats, and file transfers over a custom TCP protocol.
 
 This document describes every mechanism, byte pattern, and component as they exist in the
 code today.
@@ -12,9 +11,9 @@ code today.
 ## Implementation status
 
 Private chats use a Signal-inspired design: a signed-prekey handshake followed by a
-directional ratchet with ephemeral-key rotation. It is implemented, tested, and working end
-to end. Group chats are paused, because they depend on direct sessions that now need a
-prekey bundle their rosters do not carry.
+directional ratchet with ephemeral-key rotation. Group chats use per-member sender keys
+delivered over those direct sessions, with a signed membership log that every client
+verifies. Both are implemented, tested, and working end to end.
 
 | Area | Status | Notes |
 | :--- | :--- | :--- |
@@ -23,22 +22,24 @@ prekey bundle their rosters do not carry.
 | Session persistence | **Working** | Ratchet state is saved atomically before each message is released, and restored on start. |
 | Login | **Working** | The client proves it holds the account's signing key by signing a server challenge. |
 | Key verification (safety numbers) | **Working** | `/safety` shows a number to compare out of band. |
-| Group chats | **Not working** | Sender keys travel over direct sessions, which now need a prekey bundle that group rosters do not carry. Paused. |
-| Membership changes | **Paused** | Depends on group chats. |
-| Out-of-order messages | **Working** | Direct chats: skipped-key tracking, up to 1000 ahead, kept 7 days. Groups: up to 2000. |
+| Group chats | **Working** | Each member owns a sender key per group (a ratcheting chain plus an Ed25519 signing key) and hands it to every other member inside their direct session. One encryption and one signature per message; the server fans out the same ciphertext. |
+| Group forward secrecy and healing | **Working** | The chain only moves forward and old keys are deleted. A sender key is replaced every 100 messages, every 7 days, and whenever a member leaves or is removed. |
+| Group sender authentication | **Working** | Every message is signed by its sender's key, so members who all hold each other's chain keys still cannot forge one another. |
+| Membership changes | **Working** | Admin-signed, hash-chained, and verified by every client. The server only orders them. |
+| Out-of-order messages | **Working** | Direct chats and groups: skipped-key tracking, up to 1000 ahead, kept 7 days. |
 | Deferred delivery | **Working, with a gap** | A direct message whose epoch has not arrived yet is held and replayed, not dropped. Losing *every* message of an epoch sticks that direction until someone runs `/dm`; see *Known limitations*. |
 | Media transfer | **Working** | Unchanged by the rewrite. Encrypted blobs go directly to Supabase; only a metadata envelope is relayed. |
-| Group admin controls | **Working** | Server-enforced. Admin is purely a membership role and has no part in key distribution. |
+| Group admin controls | **Working** | Enforced by the server *and* re-checked by every client from the signed log. Admin is a membership role and has no part in key distribution. |
 
 ### Tests
 
-150 tests across the three modules, plus 9 fuzz targets and end-to-end tests that
+189 tests across the three modules, plus 11 fuzz targets and end-to-end tests that
 run the real server binary and drive the real client code over a socket.
 
 ```bash
-cd common && go test ./...      # protocol codecs, ID ordering
-cd client && go test ./...      # ratchet, handshake, persistence, group chains, pending queue, end-to-end
-cd server && go test ./...      # routing, membership authorization
+cd common && go test ./...      # protocol codecs, ID ordering, the membership state machine
+cd client && go test ./...      # ratchet, handshake, persistence, sender keys, membership, pending queue, end-to-end
+cd server && go test ./...      # routing, signed membership log, concurrent changes
 
 # Fuzz the decoders that parse untrusted bytes
 cd common && go test -run '^$' -fuzz='^FuzzDecodeConvInfo$' -fuzztime=60s
@@ -51,11 +52,25 @@ cd common && go test -run '^$' -fuzz='^FuzzDecodeConvInfo$' -fuzztime=60s
 
 These are deliberate, not oversights.
 
-- **Group messaging is off.** Group sender keys travel over the direct channel each pair of
-  members shares, and a ratcheted direct session needs the peer's prekey bundle to open.
-  The group roster carries only identity keys. Until it carries bundles, groups cannot
-  distribute keys.
-- **Delivery is trusted to be lossless.** The server has no per-direction sequence numbers
+- **Group keys wait on 1:1 sessions.** A sender key goes to each member inside their direct
+  session, which needs their prekey bundle to open. The server sends bundles alongside the
+  membership changes that introduce a member, and a send that cannot yet reach everyone is
+  held and retried rather than sent, so nobody misses messages that went out before they
+  could be keyed. A member whose bundle never arrives blocks sends to that group.
+- **A removal costs about one direct message per pair of members**, spread over each
+  member's next send. That is fine for a few hundred members; larger groups would need a
+  different design (MLS).
+- **Group history is not backfilled.** A new member reads nothing sent before they joined,
+  by design, and a message sent while a member's key is still on its way is held for up to
+  7 days in memory only. A client restarted inside that time loses what it was holding.
+- **Last-admin leave is two signed changes.** The leaving client promotes the first other
+  member, then leaves. If another admin's change lands in between, the pair is re-worked
+  against the new log, up to four times, and then reported as failed.
+- **Group names and the directory hints are not signed.** The server supplies display names
+  and prekey bundles. A bundle that does not match the keys the signed log names is
+  ignored, but the name is shown as given.
+- **One device per user.** Each device would need to be its own member with its own sender
+  keys; that is not implemented.- **Delivery is trusted to be lossless.** The server has no per-direction sequence numbers
   and no resend, and offline queues are capped at 512 packets. Out-of-order delivery is
   handled. *Loss* is not, in one case. Losing a single message is harmless, since every
   message in an epoch carries what is needed to open it. But if **every** message of an
@@ -78,10 +93,13 @@ These are deliberate, not oversights.
   old key exist; nothing calls them.
 - **The server is trusted for key distribution until safety numbers are compared.** It hands
   out bundles, so a malicious server can substitute its own. `/safety` is the check.
-- **Group membership is server-authoritative.** Clients trust the member list in the
-  broadcast, so a malicious server could add a silent member.
-- **Ratchet state is stored unencrypted on disk**, in `gomesh-state/` next to
-  `identity.key`, with owner-only permissions, as the identity key already is.
+- **The first membership change is trusted on first use.** Every later change is checked
+  against the signed log, so a malicious server cannot add a silent member. But the log
+  starts with a create the creator signed with a key the server vouched for, so a server
+  that substitutes keys *before* a group exists is the same attack as for a direct chat, and
+  `/safety` is the same check.
+- **Ratchet and group sender-key state is stored unencrypted on disk**, in `gomesh-state/`
+  next to `identity.key`, with owner-only permissions, as the identity key already is.
 
 ---
 
@@ -152,7 +170,7 @@ decrypting is repaired, whichever side notices it.
 | `/group <name> <user1,user2>` | Create a group |
 | `/chat <number>` | Switch the active conversation |
 | `/list` | List conversations |
-| `/add`, `/remove` `<username>` | Add or remove a group member (admin) |
+| `/add`, `/remove` `<username>` | Add or remove a group member (admin). Each is a change the admin signs. |
 | `/admin`, `/remove_admin` `<username>` | Grant or revoke admin |
 | `/leave` | Leave the current group |
 | `/safety` | Show the safety number of the current private chat |
@@ -196,8 +214,12 @@ only on the recipients'.
   rotates. Its public half is in every message header.
 - **Root and chain keys (direct)**: Each *direction* has its own root key, advanced only by
   that direction's sender. A chain key derives one message key per message.
-- **Sender chain keys (group)**: Each member holds one sending chain per group, plus one
-  receiving chain per other member. There is no shared group key.
+- **Sender keys (group)**: Each member holds, per group, one *sender key*: a chain key that
+  ratchets once per message and an Ed25519 signing key pair, both replaced together. They
+  hold one receiving copy per other member (the current key and, for 24 hours after a
+  rotation, the previous one). There is no shared group key, so members rotating at the
+  same moment never conflict.
+- **Identity signing key (group)**: The Ed25519 key that signs membership changes.
 
 ### 1.3 Mechanisms
 
@@ -246,6 +268,12 @@ hash, so the peer cannot be recovered from it — sessions store `PeerID` explic
 | `MaxUnackedEpochs` | 20 | Epochs the peer may leave unanswered before DH rotation stops. |
 | `SkippedKeyTTL` | 7 days | How long a key for a message that never arrived is kept. |
 | `SPKGrace` | 30 days | How long a retired signed prekey's private half is kept. |
+| `GroupRotateEvery` | 100 | Messages this member sends under one sender key before replacing it. |
+| `GroupRotateMaxAge` | 7 days | How old a sender key may get before it is replaced. |
+| `OldKeyGrace` | 24 hours | How long a peer's previous sender key stays readable after they rotate. |
+| `MaxSkipGroup` | 1000 | How far ahead of a sender key's chain a message may claim to be. |
+| `GroupPendingTTL` | 7 days | How long a group message waits for the key or membership it needs. |
+| `MaxGroupMembers` | 256 | Members in one group. |
 | `auxIdle` / `auxMaxMessages` | 5 min / 100 | How long the losing session of a simultaneous handshake stays readable. |
 | `maxRetiredInits` | 16 | Superseded handshakes remembered per conversation. |
 | `loginProofTimeout` | 10 s | How long the server waits for a login proof. |
@@ -297,26 +325,40 @@ The initiator's ephemeral key is carried explicitly in the handshake fields. `Ra
 moves on at every rotation, and a later message that repeats the handshake still needs the
 original.
 
-**Group message**:
+**Group message** (`MsgText`, `MsgMediaMeta` in a group conversation):
 
 ```
-[Epoch uint32 (4)] [SeqNum uint32 (4)] [Nonce (24)] [Ciphertext + Poly1305 tag]
+[Header (46)] [Signature (64)] [Nonce (24)] [Ciphertext + Poly1305 tag]
 ```
 
-The counters and epochs travel in the clear but are **covered by the associated data**, so
-they are authenticated. They are indices, not key material: deriving message key *n*
-requires the chain key, which never leaves the client.
+| Header field | Size | Meaning |
+| :--- | :--- | :--- |
+| Version | 1 | Always 1. |
+| GroupID | 16 | The group; must equal the packet's `ConversationID`. |
+| SenderID | 16 | The sender; must equal the packet's server-stamped `SenderID`. |
+| KeyID | 4 | Which of the sender's sender keys sealed this. Starts at 1 and rises on every rotation. |
+| N | 4 | The message's position in that key's chain. |
+| MembershipVersion | 4 | The newest membership version the sender had verified. |
+| MsgType | 1 | Text or media. The packet header sits outside the signature, so the type is repeated here to stop a relay presenting one as the other. |
 
-The counter is what lets a receiver recover from reordering and from losing *some*
-messages. This server can cause both, since its offline queue drops oldest-first at 512
-packets. A receiver that simply ratcheted once per arrival would fall permanently out of
-step the first time a message went missing. With the counter it can skip forward, keep the
-passed-over keys for a late arrival, and carry on. In a direct chat that works within an
-epoch. Losing an *entire* epoch is the one case it cannot absorb; see *Known limitations*.
+The header is the AEAD's associated data. The signature is Ed25519 by the sender key's
+signing key over the header and the ciphertext. Receivers check it **before** doing any
+chain work, so a forged message cannot move a chain.
 
-The group epoch identifies which generation of a sender's chain the message was sealed
-with, so a receiver holding an older generation can tell "they have rekeyed, the new key
-is coming" apart from "this is corrupt".
+A receiver derives message key *n* by stepping the sender's chain from where it stands,
+setting aside the keys it steps over for messages that arrive late. Nothing is written back
+until the signature and the ciphertext both verify, so forged packets cannot push a chain
+past where the real messages are.
+
+**Sender key distribution** (`CtrlSenderKey`, always inside a 1:1 ratchet session):
+
+```
+[Version 1 = 2] [GroupID 16] [KeyID 4] [ChainKey 32] [N 4] [SignPub 32] [MembershipVersion 4]
+```
+
+The key's owner is the **session's peer**, never a field of the payload. The chain key is
+the chain at position `N`, so the recipient reads that message and everything after it, and
+nothing before.
 
 ### 2.3 Operations
 
@@ -366,37 +408,72 @@ A single reply tells the client whether the conversation is a group and supplies
 member's identity and signing keys. For a direct chat that confirms the key the first
 message claimed, and provides what the safety number needs.
 
-#### Creating a group (`0x12 CtrlGroupCreate`)
+#### Membership is a signed log
 
-- **Client → Server**: `[NameLen 1] [GroupName] [MemberCount 1]` then `[UserLen 1] [Username]`…
-- **Server → Broadcast**: `[ConvID 16] [NameLen 1] [GroupName] [MemberCount 1]` then per
-  member `[UserID 16] [PubKey 32] [NameLen 1] [Name]`
+The server decides who receives a group's traffic, so on its own it could quietly add
+itself. Every change to a group is therefore signed by the member who made it, chained to
+the one before by hash, and verified by every client. The server assigns the order and
+refuses what is invalid, but clients do not take its word for either.
 
-The roster carries identity keys only. A ratcheted direct session needs a full prekey
-bundle to open, so members cannot derive direct sessions from it, and group key
-distribution is paused until it carries bundles. The server still registers the **pairwise
-conversations** between all members at this point, so sender-key packets would have
-somewhere to be relayed without each pair first exchanging a `CtrlDirectInit`.
+```
+GroupChange = [Version 1] [GroupID 16] [ChangeVersion 4] [PrevHash 32] [Action 1]
+              [Actor 16] [Timestamp 8] [TargetCount 2] { [ID 16] [IdentityKey 32] [SigningKey 32] }
+SignedChange = GroupChange ‖ Ed25519(actor's identity signing key)
+PrevHash     = SHA-256("GoMesh-GroupChangeHash-v1" ‖ SignedChange of the previous change)
+```
 
-#### Sender key distribution (`0x1D CtrlSenderKey`)
+| Action | Who may sign it | Rule |
+| :--- | :--- | :--- |
+| `create` | the creator | Version 1. Lists every initial member, the creator included. The creator is the first admin. |
+| `add` | an admin | Targets must not already be members. |
+| `remove` | an admin | Targets must be members, and not the actor (an admin leaves with `leave`). |
+| `leave` | the member leaving | Names only themselves. **The last admin may not leave a group that has other members**; they promote someone first. |
+| `promote` | an admin | Targets must be non-admin members. |
+| `demote` | an admin | Must leave at least one admin. |
 
-- **Body**: `[GroupID 16] [Epoch uint32 (4)] [ChainKey 32]`
+A change that introduces someone carries their identity and signing keys, signed by the
+admin who vouches for them, so the log is self-contained: later signatures verify against
+keys the log itself established. Clients apply changes strictly in version order and buffer
+any that arrive early. A change that is unsigned, wrongly signed, from a non-member, from a
+non-admin, or not built on the current head is refused and changes nothing.
 
-Sent from one member to one other member, always **inside a packet encrypted with the
-direct session** the two share, so the server relays it as ordinary data and never sees
-the chain key. (Paused along with groups.)
+Of two admins who submit at the same version, the server accepts the first; the second is
+sent a reject naming the head and works its request out again on top, as the client does
+automatically.
 
-#### Group administration
+| Type | Direction | Body |
+| :--- | :--- | :--- |
+| `0x12 CtrlGroupCreate` | client → server | `[NameLen 2] [Name] [SignedChange] [HintCount 2]…`; the first change of a new group. |
+| `0x13 CtrlGroupChange` | both | Same body. Client → server submits a change; server → members is an accepted one, with hints for whoever it introduced. A removed member is sent the removal too. |
+| `0x14 CtrlGroupChangeReject` | server → submitter | `[GroupID 16] [ChangeHash 32] [HeadVersion 4] [ReasonLen 2] [Reason]` |
+| `0x1B CtrlGroupLogRq` | client → server | `[GroupID 16] [FromVersion 4]`. Members only. Answered with every later change, then a `CtrlGroupHints`. |
+| `0x1C CtrlGroupHints` | server → client | `[GroupID 16] [HintCount 2]` then per member `[ID 16] [NameLen 2] [Name] [PrekeyBundle 164]`. |
+| `0x24 CtrlUserLookupRq` / `0x25 CtrlUserLookupAck` | | A username in; `[ID 16] [PrekeyBundle 164] [Name]` out, or empty if there is no such user. Needed to name a person in a change. |
 
-| Type | Operation |
-| :--- | :--- |
-| `0x13 CtrlGroupAdd` | Add a member. Broadcast carries the new member's identity key. |
-| `0x14 CtrlGroupRemove` | Remove a member, or leave. |
-| `0x1B CtrlGroupMakeAdmin` | Elevate to admin. |
-| `0x1C CtrlGroupRemoveAdmin` | Revoke admin. |
+**Hints** are directory data (a name and a prekey bundle) so that direct sessions can be
+opened without a round trip. They are not signed; a client keeps one only if its bundle
+verifies and matches the identity and signing keys the signed log names for that member.
 
-Admin is a **membership role only**. It confers no part in key distribution — every member
-distributes their own sender key regardless.
+The server also registers the **pairwise conversations** between all members when a group
+is created or grown, so sender keys have somewhere to be relayed. It refuses to fan a
+`CtrlSenderKey` out to a group.
+
+#### Sending, receiving and rotating
+
+- **Sending** (`EncryptGroupPacket`, one choke point for text and media). Replace the sender
+  key first if it is due, or a member has left, or there is none. Then give the *current*
+  chain position to every member who lacks it, over their direct session. Then advance the
+  chain, encrypt once, sign, and **save before anything is returned**. Distribution is
+  lazy: a rotation or an add costs nothing until this member next speaks, and members who
+  never speak never distribute. If any member cannot be reached yet, nothing is consumed
+  and the message waits.
+- **Removal.** Every remaining member marks its key for replacement and forgets the removed
+  member's. The new key goes only to people the verified log names, so the removed member
+  never receives it and cannot read anything sent after they left. What they already
+  received stays readable to them, which no scheme can prevent.
+- **Add.** Nothing rotates. The newcomer is not in anyone's delivered set, so each member's
+  next send gives them the *current* chain position, which only moves forward.
+- **A peer's device starting over** is treated as a removal and an add.
 
 #### Media transfers (`0x04 MsgMediaMeta`)
 
@@ -433,8 +510,9 @@ A TCP broker handling concurrent connections, state, and routing.
 - **Users** (`users`, `usernames`): user records, each with its prekey bundle (identity key,
   signing key and signed prekey, all public) and a per-user offline queue.
 - **Connections** (`clients`, `conns`): active sockets, guarded by `sync.RWMutex`.
-- **Conversations** (`convs`): both 1-to-1 and group, each with a member list and an admin
-  set, used to authorize routing.
+- **Conversations** (`convs`): both 1-to-1 and group, each with a member list used to
+  authorize routing. A group also holds its signed change log and the membership it
+  defines.
 
 ### 3.2 Delivery
 
@@ -452,16 +530,18 @@ disconnected, and its backlog spills to the offline queue. The offline queue is 
    Every inbound packet has its `SenderID` overwritten with the authenticated user ID.
 2. **`handleData`** — looks the conversation up, verifies the sender is a member, and fans
    out to everyone else. A **blind relay**: with `FlagEncrypted` set it never inspects the
-   body. Carries `MsgText`, `MsgMediaMeta`, and `CtrlSenderKey`.
+   body. Carries `MsgText`, `MsgMediaMeta`, and `CtrlSenderKey` (two-party conversations only).
 3. **`handleDirectInit`** — answers a `/dm` with the target's prekey bundle and registers the
    conversation, without notifying the target. **`handleConvInfoRq`** — the
    membership-gated roster lookup described in §2.3.
 4. **`handleUploadRq` / `handleDownloadRq`** (`supabase.go`) — the only endpoints that talk
    to Supabase. They validate membership and mint short-lived signed URLs.
-5. **Admin verification** — `handleGroupAdd`, `handleGroupRemove`, `handleGroupMakeAdmin`
-   and `handleGroupRemoveAdmin` check `conv.Admins[sender.UserID]` before propagating.
-   A member may always remove *themselves*; removing anyone else requires admin. The last
-   admin cannot be demoted, and if the last admin leaves, a remaining member is promoted.
+5. **Membership log** (`groups.go`) — `handleGroupCreate` and `handleGroupChange` run each
+   submitted change through the same `common.Membership` state machine the clients use,
+   under a per-group lock so check, apply and append are one step. They also confirm that
+   every key a change names matches the directory. `handleGroupLogRq` replays the log to a
+   member and `handleUserLookup` resolves a username. Nothing here promotes anyone: an
+   admin is whoever a signed change says.
 
 ---
 
@@ -514,16 +594,23 @@ when a message with handshake fields matches no session it holds.
   replaced, whether by a forced `/dm` or by the peer's restart. The client uses it to
   discard packets held for the old session, which could never be read.
 
-**Group sessions.** A `GroupSession` holds this client's own sending chain and epoch, plus
-one receiving chain per other member and one previous generation per member:
+**Group state** (`client/group.go`). A `groupState` per group is saved atomically and holds
+the verified `Membership`, this member's own sender key (`ownSenderKey`), each peer's
+current and previous sender key (`peerKeys`), sender keys held while membership catches up,
+and the directory hints. `GroupSession` and the per-sender epoch scheme are gone.
 
-- `RotateSenderKey(groupID)` generates a fresh chain and bumps this member's own epoch.
-  **Only the key it returns may be distributed** — the live chain ratchets forward with
-  every message, so reading it back later would hand peers a key that cannot open anything
-  already sent in that epoch.
-- `SetPeerSenderKey` installs a member's chain, retiring the one it replaces. A key at an
-  epoch already passed is ignored, so a replayed distribution cannot wind a chain backwards.
-- Epochs are **per sender**, not group-wide, so members never have to agree on a number.
+- `ApplyGroupChange` verifies and applies a membership change, buffers one that arrives
+  ahead of the log, and acts on its effects: a removal marks our key for replacement and
+  deletes the removed member's keys; being removed clears the group and leaves a tombstone
+  so a later sender key for it is refused rather than held.
+- `ReceiveSenderKey` installs a key from a 1:1 session. It refuses one from a non-member,
+  ignores a stale `KeyID`, retires the key it replaces for `OldKeyGrace`, and **holds** one
+  whose `MembershipVersion` is ahead of ours: the 1:1 message it came in is consumed and
+  cannot be fetched again, so rejecting it would lose the key until its owner next rotates.
+- `DecryptGroupPacket` checks the header against the packet, the sender against the
+  verified membership, then the signature, and only then steps the chain on a copy.
+- `PeerKeysChanged` handles a peer whose session was replaced: it forgets their keys and
+  that they hold ours, and marks ours for replacement.
 
 **Shared ratchet handling.** `advanceChain` derives the message key for a sequence number
 and returns a *prospective* chain state. Nothing is written back until the ciphertext
@@ -531,8 +618,8 @@ authenticates. Committing first would let a forged sequence number push the chai
 where real messages can reach it — permanently rejecting everything that follows — and let
 a replay consume a stored skipped key that a genuine late message still needed.
 
-**Recoverable failures.** `ErrNoSession`, `ErrNoGroupSession`, `ErrNoSenderKey` and
-`ErrEpochGap` mean
+**Recoverable failures.** `ErrNoSession`, `ErrNoGroupSession`, `ErrNoSenderKey`,
+`ErrMembershipBehind` and `ErrEpochGap` mean
 "not yet" rather than "never". `Recoverable(err)` distinguishes them from a genuine reject
 (bad tag, duplicate, retired epoch), which is what decides whether a packet is held or
 dropped.
@@ -596,21 +683,22 @@ An unknown *group* message initially takes the direct branch, because `IsGroup` 
 false for anything unregistered. That resolves itself: the roster reply says which it
 really is, and the replayed packet takes the correct branch on the second pass.
 
-**Joining or creating a group** (paused): `bootstrapGroupKeys` generates this client's own
-sending chain and unicasts it to each member over the direct channel they share. A direct
-session now needs a prekey bundle to open and the group roster does not carry one, so
-`ensureDirectSession` can only log a warning and the keys are not delivered.
+**Commands become intents.** A change is only valid on one version of the log, so `/add`,
+`/remove`, `/promote`-style commands record what the user asked for (`groupIntent`) and
+work out the signed change against the current log (`nextChange`). If the server refuses it
+because another admin's change landed first, the intent is worked out again once the
+client has caught up. `/leave` by the last admin becomes `promote`, then `leave`.
 
-**On any membership change**, every member generates a fresh sender key and redistributes
-to the current roster. Removal additionally drops the departed member's chain. This is
-mandatory on removal: a removed member holds everyone's chain keys, and a chain ratchets
-forward on its own, so without a rekey they would keep reading the group indefinitely.
-Rotating on add too means a joiner cannot read anything sent before they arrived.
+**Group traffic waits for its inputs.** A group message from a membership version we have
+not verified, or from a sender whose key has not arrived, is held for up to
+`GroupPendingTTL` and replayed when the log advances or the key lands. A send that cannot
+yet reach every member is queued and retried when their bundles arrive.
 
 ### 4.5 `ClientManager` (`client/manager.go`)
 
-Tracks conversations, membership, admin sets, usernames, and cached public keys. Public
-keys now arrive with rosters and group broadcasts, so there is no blocking fetch.
+Tracks conversations, usernames, and cached public keys for display and early command
+checks. For groups its member and admin sets are copied from the verified membership;
+nothing cryptographic reads them.
 
 **Media** (`media.go`, `thumbnail.go`): on `/file`, `sendMedia` detects the MIME type,
 hashes and encrypts the file, requests a signed upload URL, PUTs the ciphertext, and sends
@@ -640,15 +728,24 @@ transfers.
   rather than taking effect.
 - **Verify-before-commit.** Ratchet state advances only after a ciphertext authenticates,
   so forged packets cannot desynchronize a chain or destroy a stored key.
-- **Group removal is meaningful.** Every member rekeys on any membership change, so a
-  removed member's keys stop working for traffic sent after they left.
-- **Server-enforced authorization.** Group operations are checked against the admin set,
-  and public keys are only released to conversation members.
-- **Bounded resources.** Skipped keys are capped at 1000 ahead in a direct chat (4000 held
-  in total) and 2000 in a group, held packets at 64 per conversation and 512 total, retained
-  private ratchet keys at 20 unanswered epochs, offline queues at 512 per user.
+- **Group removal is meaningful.** Every remaining member replaces their sender key before
+  they next send, and gives the new one only to members the verified log names, so a
+  removed member cannot read anything sent after they left.
+- **Group senders cannot be forged.** Members hold each other's chain keys, so the
+  per-message Ed25519 signature is what proves who wrote something.
+- **The server cannot edit membership.** Changes are signed by an admin, chained by hash,
+  and checked by every client, so a server that adds itself, reorders, or invents a change
+  is refused. It can still withhold changes, which shows as a group that stops growing.
+- **Authorization is checked twice.** The server refuses invalid changes, and every client
+  re-checks from the signed log. Public keys are only released to conversation members.
+- **Bounded resources.** Skipped keys are capped at 1000 ahead in a direct chat and in a
+  group (4000 held in total per chain), held packets at 64 per conversation and 512 total,
+  held sender keys at 64 per group, verified groups at 256 (plus at most 32 placeholders for
+  groups only heard of through a sender key, which expire after 7 days, and 512 records of
+  groups left), buffered membership changes at 64,
+  retained private ratchet keys at 20 unanswered epochs, offline queues at 512 per user.
 
-**Also holds, for direct chats:**
+**Also holds, for direct chats and groups:**
 
 - **Forward secrecy.** Message keys are erased on use and ratchet keys once the peer has
   moved past them, so a stolen device or key file cannot decrypt messages already read.
@@ -663,7 +760,14 @@ transfers.
 
 **What does not hold** — see *Known limitations* at the top for detail:
 
-- Group chats are disabled.
+- **Group healing is periodic.** A stolen sender key reads that member's future messages
+  until their next rotation, at most 100 messages or 7 days away, or a removal. Rotation
+  heals because the new key travels over 1:1 sessions, which heal on their own.
+- **A group message is readable by whoever holds a member's chain key**, which is every
+  member, so a member can prove nothing to a third party about what another said beyond the
+  signature itself.
+- **Group metadata is visible to the server:** group IDs, members, sizes, timing, and who
+  sends. It never sees chain keys, signing seeds or plaintext.
 - No protection against a malicious server substituting keys, *unless* the two people
   compare safety numbers (`/safety`).
 - A direction is stuck if every message of one epoch is lost. A single lost message is

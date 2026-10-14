@@ -153,7 +153,7 @@ func sendMedia(convID [16]byte, path string) {
 	}
 
 	if mgr.IsGroup(convID) {
-		if encErr := sessionMgr.EncryptGroupPacket(&pkt); encErr != nil {
+		if encErr := sendGroupMessage(&pkt); encErr != nil {
 			tuiPrintf("[ERROR] Group encryption failed for media: %v", encErr)
 			return
 		}
@@ -162,8 +162,8 @@ func sendMedia(convID [16]byte, path string) {
 			tuiPrintf("[ERROR] Encryption failed for media: %v", encErr)
 			return
 		}
+		sendPacket(&pkt)
 	}
-	sendPacket(&pkt)
 
 	// Echo into the sender's own conversation pane.
 	emitMediaMessage(convID, "You", meta)

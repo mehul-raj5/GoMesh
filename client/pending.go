@@ -20,6 +20,17 @@ const (
 type pendingPacket struct {
 	pkt      common.Packet
 	parkedAt time.Time
+	// ttl is how long this packet may wait. Zero means pendingTTL; group messages
+	// wait for a sender key or a membership change that can take far longer.
+	ttl time.Duration
+}
+
+func (p pendingPacket) expired(now time.Time) bool {
+	ttl := p.ttl
+	if ttl == 0 {
+		ttl = pendingTTL
+	}
+	return p.parkedAt.Before(now.Add(-ttl))
 }
 
 // pendingQueue holds packets that could not be decrypted yet because the key
@@ -48,6 +59,11 @@ func newPendingQueue() *pendingQueue {
 // count caps are what actually bound the queue; the TTL only clears out
 // conversations that have gone quiet.
 func (q *pendingQueue) Park(convID [16]byte, pkt common.Packet) bool {
+	return q.ParkFor(convID, pkt, pendingTTL)
+}
+
+// ParkFor is Park with a lifetime for the packet other than the default.
+func (q *pendingQueue) ParkFor(convID [16]byte, pkt common.Packet, ttl time.Duration) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -61,7 +77,7 @@ func (q *pendingQueue) Park(convID [16]byte, pkt common.Packet) bool {
 		held = append([]pendingPacket(nil), held[len(held)-(maxPendingPerConv-1):]...)
 	}
 
-	q.byConv[convID] = append(held, pendingPacket{pkt: pkt, parkedAt: time.Now()})
+	q.byConv[convID] = append(held, pendingPacket{pkt: pkt, parkedAt: time.Now(), ttl: ttl})
 	q.total++
 
 	for q.total > maxPendingTotal {
@@ -93,13 +109,13 @@ func (q *pendingQueue) release(convID [16]byte, senderID *[16]byte) []common.Pac
 		return nil
 	}
 
-	cutoff := time.Now().Add(-pendingTTL)
+	now := time.Now()
 	var out []common.Packet
 	kept := held[:0]
 
 	for _, p := range held {
 		switch {
-		case p.parkedAt.Before(cutoff):
+		case p.expired(now):
 			q.total-- // too old to be worth replaying
 		case senderID != nil && p.pkt.Header.SenderID != *senderID:
 			kept = append(kept, p)
@@ -119,11 +135,10 @@ func (q *pendingQueue) release(convID [16]byte, senderID *[16]byte) []common.Pac
 
 // sweepLocked drops everything past its TTL.
 func (q *pendingQueue) sweepLocked(now time.Time) {
-	cutoff := now.Add(-pendingTTL)
 	for convID, held := range q.byConv {
 		kept := held[:0]
 		for _, p := range held {
-			if p.parkedAt.Before(cutoff) {
+			if p.expired(now) {
 				q.total--
 				continue
 			}

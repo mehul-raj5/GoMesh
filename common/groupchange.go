@@ -25,6 +25,9 @@ const (
 	ActionLeave   GroupAction = 4
 	ActionPromote GroupAction = 5
 	ActionDemote  GroupAction = 6
+	// ActionRekey moves a member to new keys, as when their account signs in
+	// on a new device. They stay a member, with the same role.
+	ActionRekey GroupAction = 7
 )
 
 func (a GroupAction) String() string {
@@ -41,6 +44,8 @@ func (a GroupAction) String() string {
 		return "promote"
 	case ActionDemote:
 		return "demote"
+	case ActionRekey:
+		return "rekey"
 	}
 	return fmt.Sprintf("action(%d)", uint8(a))
 }
@@ -198,9 +203,13 @@ var (
 	ErrBadChange   = errors.New("invalid membership change")
 )
 
-// KeyPin returns the signing key a client independently knows for a user, such
-// as one it saw in a prekey bundle. A change that contradicts a pinned key is
-// refused.
+// KeyPin returns the signing key the directory holds for a user now. A change
+// whose actor, or whose new members, contradict it is refused.
+//
+// Only the server pins, and only on changes as they are submitted. A pin is the
+// current key, and a log that rekeys a member legitimately holds older keys for
+// them, so a client replaying history would refuse it. Clients check keys where
+// they use them instead: see the "settled" rule in the client.
 type KeyPin func(id [IDSize]byte) (signing [KeySize]byte, known bool)
 
 // Membership is the group as the signed log defines it. The zero value is a
@@ -264,6 +273,7 @@ type ChangeEffect struct {
 	Removed  [][IDSize]byte // removed or left
 	Promoted [][IDSize]byte
 	Demoted  [][IDSize]byte
+	Rekeyed  []MemberKey // the member and their new keys
 }
 
 func bad(format string, args ...any) error {
@@ -325,7 +335,27 @@ func (m *Membership) Check(sc *SignedChange, pin KeyPin) error {
 	}
 
 	var actorKey [KeySize]byte
-	if c.Action == ActionCreate {
+	switch c.Action {
+	case ActionRekey:
+		// A rekey is signed by the new key, because the device holding the old one
+		// may be gone. That is the one place a member's keys can change without an
+		// admin: the server could do it too, which is why every client shows it.
+		if len(c.Targets) != 1 || c.Targets[0].ID != c.Actor {
+			return bad("a rekey names only the member it rekeys")
+		}
+		t := c.Targets[0]
+		if !validMemberKey(t) {
+			return bad("rekey for %x carries a missing key", t.ID[:4])
+		}
+		cur, ok := m.Key(c.Actor)
+		if !ok {
+			return bad("actor %x is not a member", c.Actor[:4])
+		}
+		if cur.IdentityKey == t.IdentityKey || cur.SigningKey == t.SigningKey {
+			return bad("a rekey must carry a new identity key and a new signing key")
+		}
+		actorKey = t.SigningKey
+	case ActionCreate:
 		if err := checkTargets(c.Targets); err != nil {
 			return err
 		}
@@ -341,7 +371,7 @@ func (m *Membership) Check(sc *SignedChange, pin KeyPin) error {
 		if !found {
 			return bad("creator is not among the members")
 		}
-	} else {
+	default:
 		k, ok := m.Key(c.Actor)
 		if !ok {
 			return bad("actor %x is not a member", c.Actor[:4])
@@ -371,8 +401,8 @@ func (m *Membership) Check(sc *SignedChange, pin KeyPin) error {
 // authorize applies the per-action rules to an authenticated change.
 func (m *Membership) authorize(c *GroupChange) error {
 	switch c.Action {
-	case ActionCreate:
-		return nil
+	case ActionCreate, ActionRekey:
+		return nil // checked in full before the signature
 
 	case ActionAdd:
 		if !m.IsAdmin(c.Actor) {
@@ -493,6 +523,15 @@ func (m *Membership) Apply(sc *SignedChange, pin KeyPin) (ChangeEffect, error) {
 			m.removeAdmin(t.ID)
 			eff.Demoted = append(eff.Demoted, t.ID)
 		}
+
+	case ActionRekey:
+		t := c.Targets[0]
+		for i := range m.Members {
+			if m.Members[i].ID == t.ID {
+				m.Members[i].IdentityKey, m.Members[i].SigningKey = t.IdentityKey, t.SigningKey
+			}
+		}
+		eff.Rekeyed = append(eff.Rekeyed, t)
 	}
 
 	m.Version = c.Version

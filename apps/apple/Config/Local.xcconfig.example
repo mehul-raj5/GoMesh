@@ -1,0 +1,20 @@
+// Copy to Local.xcconfig (ignored by git) and fill in what applies, then run
+// `make xcodeproj`. See docs/deploy-ec2.md.
+
+// Your server on EC2, as host:port: an Elastic IP or a DNS name for it.
+GOMESH_DEFAULT_SERVER = 203.0.113.10:8080
+
+// To run on a real iPhone: your team ID, from Xcode > Settings > Accounts (a
+// free Apple ID works, and the app then has to be reinstalled every 7 days).
+// Only device builds are signed with it; the Mac and simulator builds stay
+// signed to run locally, so they need no certificate.
+DEVELOPMENT_TEAM[sdk=iphoneos*] = ABCDE12345
+CODE_SIGN_STYLE[sdk=iphoneos*] = Automatic
+CODE_SIGN_IDENTITY[sdk=iphoneos*] = Apple Development
+
+// To keep the Mac app's keys in the Keychain (a Release build needs it), sign
+// the Mac build with the same team too:
+// DEVELOPMENT_TEAM[sdk=macosx*] = ABCDE12345
+// CODE_SIGN_STYLE[sdk=macosx*] = Automatic
+// CODE_SIGN_IDENTITY[sdk=macosx*] = Apple Development
+// GOMESH_MAC_ENTITLEMENTS = Config/GoMesh-Signed.entitlements

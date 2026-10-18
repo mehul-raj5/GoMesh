@@ -1,7 +1,7 @@
 # GoMesh: Comprehensive Project Documentation
 
 `GoMesh` is a secure messaging application supporting end-to-end encrypted (E2EE) private
-chats, end-to-end encrypted group chats, and file transfers over a custom TCP protocol.
+chats, end-to-end encrypted group chats, and file transfers over a custom protocol on TLS 1.3.
 
 This document describes every mechanism, byte pattern, and component as they exist in the
 code today.
@@ -20,7 +20,18 @@ verifies. Both are implemented, tested, and working end to end.
 | Direct chats | **Working** | Signed-prekey handshake, then a directional ratchet with ephemeral-key rotation. The recipient is never notified in advance and builds its session from the first ciphertext. |
 | Forward secrecy and self-healing (direct) | **Working** | A fresh ephemeral key is mixed in every 50 sent messages, or as soon as the peer publishes a newer one. Old keys are deleted. |
 | Session persistence | **Working** | Ratchet state is saved atomically before each message is released, and restored on start. |
-| Login | **Working** | The client proves it holds the account's signing key by signing a server challenge. |
+| Accounts | **Working** | Username and password. The server stores an argon2id hash in SQLite. Logins are throttled before any hashing. |
+| Client engine | **Working** | The client is a library, `core`, with one `Client` per signed-in account and events for the host. The terminal client and the Apple apps are thin screens over it. |
+| Apple apps (macOS, iOS) | **Working** | One SwiftUI app for the Mac and the iPhone, on the engine through `bridge/` (gomobile). Accounts and server trust; a chat list with previews, unread counts and search; private chats and groups (create, members, admins, leave); files with thumbnails, opened in Quick Look; local notifications; App Lock with Face ID, Touch ID or the passcode; VoiceOver labels and Dynamic Type; 22 themes plus Auto (Telegram Light and Dark by default), every pair of colours the screens use checked for contrast. On the iPhone the connection pauses in the background and catches up on return. The Mac's screens have not been looked at yet; the iPhone's have. |
+| Encryption at rest | **Working** | Keys live in a vault (the Keychain on Apple devices). Ratchet and group state are sealed files with HMAC names; history is sealed row by row with a per-account key; received files are sealed under random names. Sign-out deletes the key everything is sealed under. |
+| Chat history | **Working** | Kept on the device across sign-out. A later account on the same device can read an earlier one's chats, not write to them; sign-out can delete them. |
+| Reconnect | **Working** | The client reconnects on its own with backoff, resuming the session over the pinned certificate; sends are refused while offline. A device whose server is down at launch still starts, with its chats, and comes online when the server does. |
+| Delivery | **Working** | The client acknowledges what it has handled, and the server keeps every packet until it is acknowledged: one written to a connection that then dropped, or to an iPhone that iOS suspended, is delivered again on the next connection, and the client ignores the copy. |
+| Message ticks | **Working** | An outgoing message shows a clock until the server takes it, one tick once it has, two when every recipient's device has it, and two coloured ticks when every recipient has read it. In a group, "every recipient" means everyone in the chat now who was in it when the message went. *Taken* and *delivered* come from the server, which records them for 14 days so a sender that was away can ask again. *Read* is end-to-end encrypted, sent by the reader's device to the sender alone, and can be turned off in Settings. See *Receipts* below. |
+| Deployment | **Ready, not yet run** | A hardened systemd unit and a step-by-step guide for AWS EC2 in [`docs/deploy-ec2.md`](docs/deploy-ec2.md); `make server-linux` cross-compiles. |
+| Server restarts | **Working** | Accounts, conversations, group logs and offline queues live in SQLite, so a restart loses nothing queued. SIGINT or SIGTERM shuts down cleanly, saving what connected clients had not yet been sent. |
+| Login | **Working** | Password (or a saved session token), then a signed challenge proving the device holds the keys it presents. Over TLS 1.3 only; clients pin the server's certificate. |
+| Moving to a new device | **Working** | Signing in with the password on new keys moves the account. The old device is told and wipes its keys, and its queued messages are deleted. Contacts are told the new keys, direct chats restart on them, and the new device rekeys every group it is in with a change it signs, keeping its role. |
 | Key verification (safety numbers) | **Working** | `/safety` shows a number to compare out of band. |
 | Group chats | **Working** | Each member owns a sender key per group (a ratcheting chain plus an Ed25519 signing key) and hands it to every other member inside their direct session. One encryption and one signature per message; the server fans out the same ciphertext. |
 | Group forward secrecy and healing | **Working** | The chain only moves forward and old keys are deleted. A sender key is replaced every 100 messages, every 7 days, and whenever a member leaves or is removed. |
@@ -33,20 +44,18 @@ verifies. Both are implemented, tested, and working end to end.
 
 ### Tests
 
-189 tests across the three modules, plus 11 fuzz targets and end-to-end tests that
+319 tests across the four modules (common, server, core, bridge), plus 15 fuzz targets and end-to-end tests that
 run the real server binary and drive the real client code over a socket.
 
 ```bash
 cd common && go test ./...      # protocol codecs, ID ordering, the membership state machine
-cd client && go test ./...      # ratchet, handshake, persistence, sender keys, membership, pending queue, end-to-end
+cd core && go test ./...        # the client engine: ratchet, handshake, sealed state, history, sender keys, membership, reconnect, end-to-end
 cd server && go test ./...      # routing, signed membership log, concurrent changes
+cd bridge && go test ./...      # the apps' API against a real server, its error codes, the vault adapter, and every theme's contrast
 
 # Fuzz the decoders that parse untrusted bytes
 cd common && go test -run '^$' -fuzz='^FuzzDecodeConvInfo$' -fuzztime=60s
 ```
-
-> **Note:** `.gitignore` currently contains `*_test.go`, so none of the test files are
-> tracked by git. Remove that line if you want them committed.
 
 ### Known limitations
 
@@ -69,10 +78,38 @@ These are deliberate, not oversights.
 - **Group names and the directory hints are not signed.** The server supplies display names
   and prekey bundles. A bundle that does not match the keys the signed log names is
   ignored, but the name is shown as given.
-- **One device per user.** Each device would need to be its own member with its own sender
-  keys; that is not implemented.- **Delivery is trusted to be lossless.** The server has no per-direction sequence numbers
-  and no resend, and offline queues are capped at 512 packets. Out-of-order delivery is
-  handled. *Loss* is not, in one case. Losing a single message is harmless, since every
+- **One account, one device.** Signing in somewhere new moves the account there; there is
+  no multi-device. The new device starts with no history, and messages already on their way
+  to the old device when the account moved are lost.
+- **A rekey is signed by the new key, so the server could swap a member's keys.** The old
+  device may be gone, so nothing older can vouch for the move. A malicious server could rekey
+  a member to keys it holds and take their place in a group. It still cannot add or remove
+  anyone, and every member is shown "*name* is on a new device"; safety numbers detect the
+  substitution. This is the same trust Signal places in its server when someone
+  re-registers.
+- **A group a known peer appears to create is no longer refused for contradicting their
+  keys.** Clients stopped checking membership changes against keys learned elsewhere,
+  because a log that rekeys someone legitimately holds older keys. Such a group can show up
+  in the list, but nobody whose 1:1 session disagrees with the log gets anyone's sender key,
+  and the client warns about them.
+- **A server crash can lose live packets.** A packet is kept until the device acknowledges
+  it, and a dropped connection or a clean shutdown puts what was not acknowledged back on
+  the device's queue. But packets sent to a connected device are held in memory, not on
+  disk, until then, so a crash or `kill -9` of the server loses the ones not yet
+  acknowledged. Offline queues are on disk; with `synchronous=NORMAL`, only a power cut can
+  lose their last few writes.
+- **Packets are delivered at least once.** A queued row is deleted only once its packet is
+  acknowledged, and anything unacknowledged is sent again, so a device can be sent the same
+  packet twice. Clients ignore what they have already read; tests deliver a whole inbox
+  twice, and drop a connection between reading and acknowledging, to check it.
+- **The server sees passwords at login.** TLS protects them in transit and the server keeps
+  only an argon2id hash, but a malicious server could log them as they arrive. A PAKE such
+  as OPAQUE would remove that, at considerable cost.
+- **The first connection trusts the certificate it is shown.** The client pins the
+  fingerprint the user confirms, so compare it with the one the server printed.
+- **Some losses still stick a chat.** Offline queues are capped at 5,000 packets or 64 MiB
+  per device and drop the oldest first, and a server crash loses what connected devices had
+  not acknowledged. Out-of-order delivery is handled. *Loss* is not, in one case. Losing a single message is harmless, since every
   message in an epoch carries what is needed to open it. But if **every** message of an
   epoch is lost, that direction is stuck for good: each later root key chains through the
   lost epoch's ratchet key, which only its messages carry, and the sender rotating again
@@ -80,9 +117,10 @@ These are deliberate, not oversights.
   lost message can be enough. Nothing detects this automatically. The way out is to type
   `/dm <name>` on **either** side, which abandons the session and starts a fresh one; see
   *Starting over*. Messages in flight on the old session when you do this may not arrive.
-- **A device that loses its state cannot read an established peer.** The peer's messages
-  carry no handshake fields any more, so no session can be built from them. The client
-  discards what it held, says so, and tells the user to run `/dm <name>`.
+- **A device that loses its state cannot read an established peer until the peer starts
+  over.** The peer's messages carry no handshake fields any more, so no session can be built
+  from them. The client discards what it held and sends the peer a session reset, at most
+  once a minute per chat; what was in flight is lost.
 - **A handshake that arrives late is treated as a restart.** Once a session has heard from a
   peer, a message carrying different handshake fields replaces it. That needs the server to
   reorder packets, which it does not do.
@@ -98,8 +136,30 @@ These are deliberate, not oversights.
   starts with a create the creator signed with a key the server vouched for, so a server
   that substitutes keys *before* a group exists is the same attack as for a direct chat, and
   `/safety` is the same check.
-- **Ratchet and group sender-key state is stored unencrypted on disk**, in `gomesh-state/`
-  next to `identity.key`, with owner-only permissions, as the identity key already is.
+- **The terminal client's vault is plain files.** On Apple devices the vault is the Keychain,
+  sealed again by the Secure Enclave; the terminal client, a development tool, keeps the
+  account key, identity, session token and history keys as 0600 files in `vault/`, which
+  protects nothing beyond the file permissions. Its `downloads/` copies and `client.log`
+  are plaintext conveniences too.
+- **An unsigned Mac build keeps its vault in files.** The data-protection Keychain on the Mac
+  needs a development team's signature. Until `DEVELOPMENT_TEAM` is set, a Debug build keeps
+  the vault as 0600 files in the app's container, still sealed by the Secure Enclave, and
+  Settings says so; a Release build refuses to run without the Keychain. The iPhone and the
+  simulator use the Keychain.
+- **No push notifications.** A message waits in the server's queue until the app connects;
+  the app notifies only while it is running. On an iPhone the app disconnects as it goes to
+  the background, so nothing arrives until it is opened again.
+- **A group message held for sessions lives in memory.** It is kept in the history as queued
+  and sent once the group's sessions are ready; if the app quits first it is not sent, and
+  the next start marks it "not sent".
+- **App Lock covers the app, not the data.** The chats are already encrypted at rest; App
+  Lock only stops someone holding the unlocked device from reading them in GoMesh. It needs
+  a device passcode (or a Mac password). Quick Look closes when the app locks.
+- **Files are read whole and capped at 50 MB**, and go through Supabase Storage, which the
+  server needs `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` and `SUPABASE_BUCKET` for.
+- **The sign-in screen cannot name the device it will sign out.** Asking the server which
+  device holds an account before the password is checked would tell anyone, so the warning
+  is general.
 
 ---
 
@@ -109,12 +169,36 @@ The repository is a Go workspace. From the root:
 
 ```bash
 go work init                             # only if go.work is missing
-go work use ./client ./common ./server
+go work use ./bridge ./client ./common ./core ./server
+```
+
+The quickest path is the Makefile: `make dev-cert` once, then `make server` and `make tui` in
+separate terminals. `make help` lists the rest, including the Apple app targets.
+
+To run the server for real, on AWS EC2, follow [`docs/deploy-ec2.md`](docs/deploy-ec2.md):
+`make server-linux` builds it, `deploy/` holds the systemd unit and an example settings
+file, and `apps/apple/Config/Local.xcconfig` (copied from the `.example` next to it) points
+the apps at your server and holds your team ID for a real iPhone. The terminal client takes
+its default server from `GOMESH_SERVER`.
+
+Every connection is TLS 1.3. For development, create a self-signed certificate once:
+
+```bash
+make dev-cert        # writes server/dev-certs/{cert,key}.pem and prints the fingerprint
+# To reach the server from a phone on your network, add its LAN address:
+cd server && go run . -gen-dev-cert dev-certs 192.168.1.20
 ```
 
 Then run the server and one or more clients in separate terminals:
 
 ```bash
+# Optional: where the server keeps everything, accounts, conversations, group logs
+# and offline queues (default gomesh.db in the working directory), and a
+# certificate other than dev-certs/. Stop the server with Ctrl-C or SIGTERM: it
+# saves what it had not yet sent before it exits.
+export DB_PATH="gomesh.db"
+export TLS_CERT="dev-certs/cert.pem" TLS_KEY="dev-certs/key.pem"
+
 # Media send/receive uploads encrypted blobs to a Supabase Storage bucket, so the
 # server needs these three variables to mint signed upload/download URLs.
 # (Create a private bucket in your Supabase project and copy the service_role key.)
@@ -134,15 +218,85 @@ cd server && go run .
 cd client && go run .
 ```
 
-**Files the client creates** in its working directory, so run each client from its own
-directory if you want more than one identity on a machine:
+The client asks for the server address, shows the server's certificate fingerprint the
+first time, then asks you to log in or register. It saves a session token, so later starts
+skip the password. Set `GOMESH_SERVER_FP` to pin a fingerprint without the prompt.
+
+**Files the client creates** in its working directory. Each directory is one device, so run
+each client from its own directory if you want more than one account on a machine. Two
+directories signed in to the *same* account are two devices, and the second sign-in signs
+the first out.
 
 | Path | Contents |
 | :--- | :--- |
-| `identity.key` | Long-term X25519 key pair and Ed25519 signing seed. Never share it. Mode 0600. |
-| `gomesh-state/` | Signed prekeys and one saved ratchet session per private chat. Mode 0700. Deleting it makes every chat start over. |
+| `vault/` | The terminal client's stand-in for the Keychain, one 0600 file per secret: `account-key` (the random key this sign-in's state is sealed under), `identity` (the identity keys, sealed with it), `session` (server, username and token), and a `history.<account>` key per account with history here. Sign-out deletes the first three, account key first. |
+| `state/` | Signed prekeys and one ratchet session or group state per chat, each a sealed file named by an HMAC. Deleted on sign-out. |
+| `history.db` | Chat history, every row sealed with its account's history key. Kept across sign-out; another account's is read-only. |
+| `media/` | Received and sent files, sealed, under random names. |
+| `servers.json` | The certificate fingerprint pinned for each server. |
 | `client.log` | Debug log. |
-| `downloads/` | Received files. |
+| `downloads/` | Plaintext copies of received files, written by the terminal client. |
+
+A folder from an earlier version (`identity.key`, `session.json`, `gomesh-state/`) is moved
+into this layout on first start, sealed, and the plaintext files are deleted.
+
+### The Mac and iPhone app
+
+```bash
+make tools          # once: gomobile and xcodegen
+make app-mac        # builds the engine framework, generates the Xcode project, builds and opens the Mac app
+make app-sim        # the same for the iOS simulator (SIM="iPhone 16 Pro" by default)
+```
+
+`make xcframework` rebuilds only the engine (`apps/apple/Frameworks/GoMeshCore.xcframework`)
+and `make xcodeproj` only the project; neither is committed. The server address is under
+**Advanced** on the sign-in screen and defaults to `localhost:8080`, which the simulator
+reaches on the Mac it runs on. The first time, the app shows the server's fingerprint to
+compare with the one the server printed, and pins it. If the server's certificate later
+changes (a new `make dev-cert`, say), signing in says so under the server field and offers
+**Forget this server's certificate…**, after which the new fingerprint is shown to compare.
+A device that is signed in and meets a changed certificate keeps retrying; sign out first.
+
+The app keeps its device in `Application Support/GoMesh/device/`, the same layout as the
+table above with the vault in the Keychain, and excludes the folder from backups. Deleting
+the app and installing it again starts clean: Keychain items outlive an iOS app, so the
+first launch, which finds no folder, deletes them before anything else.
+
+Chats, groups and files work as in the terminal client. On the Mac, ⌘N starts a chat,
+⌘⇧N a group and ⌘K searches; contact and group info open beside the chat; files can be
+dropped onto a chat. On the iPhone, photos come from the photo picker, with their location
+removed before they are sent. Notifications say only "New message" unless the sender and
+text are turned on in Settings, because the system keeps notification text outside
+GoMesh's encryption.
+
+A Debug build of the Mac app can test itself from a script: launched with `-autotest` and
+the `GOMESH_AUTOTEST_*` variables described in `apps/apple/GoMesh/Debug/AutoTest.swift`,
+it signs up or in, or opens a chat or group, sends to it and waits for a reply, renders
+every theme to PNG files in its container's `tmp/autotest/`, writes `result.json` there,
+and quits.
+
+### Signing in on another device
+
+Signing in with the password from a directory that holds different keys moves the account
+there. The user ID stays the same, so every conversation keeps its ID.
+
+- **The old device.** The server deletes whatever was queued for it, revokes its token, and
+  sends it a "replaced" notice without waiting to see if it arrives. A running client that
+  gets the notice deletes its keys and exits; one that was offline finds out when it next
+  starts, and does the same.
+- **Contacts** are each sent a key-change notice with the new bundle. Their direct chat with
+  the account restarts on the new keys, with history intact on their side and a "safety
+  number changed" warning. In every group they share, they stop giving the account their
+  sender key and replace their own, since the old device held it.
+- **Groups.** The new device is sent the list of groups the account is in. It fetches each
+  log and signs a **rekey**: a change that puts its new keys in the log in place of the old
+  ones. The account stays a member, with the same role, so even a group's only admin can
+  move. Every member then drops the old device's sender key, replaces its own, and gives the
+  new one only to the new device. The new device sends nothing to a group until its rekey is
+  in.
+- **If a contact writes before hearing of the move,** on the old session, the new device
+  cannot read it. It sends them a session reset, and their next message starts a fresh
+  session.
 
 ### Starting over (`/dm` on an existing chat)
 
@@ -153,8 +307,11 @@ decrypting is repaired, whichever side notices it.
 
 - **Either side can do it.** The other side sees a handshake it does not recognise on an
   established session and treats it as a restart, replacing its own.
-- **Only a typed `/dm` counts.** The server's `CtrlDirectAck` resets a chat only when it
-  answers a `/dm` the user just ran, so an unsolicited ack cannot reset a working session.
+- **What else starts over.** The server's `CtrlDirectAck` resets a chat only when it answers
+  a `/dm` the user just ran, so an unsolicited ack cannot reset a working session. Two other
+  things do restart one without the user asking: a key-change notice for the peer, when the
+  session is on the old keys, and a session reset from the peer, which is honoured at most
+  once a minute per chat and ignored while this side's own fresh handshake is still pending.
 - **Old handshakes stay dead.** The replaced session's handshake keys are remembered, so a
   captured first message from it cannot be replayed to swap the fresh session back out.
 - **What is lost.** Messages either side had in flight on the old session, and anything the
@@ -175,6 +332,8 @@ decrypting is repaired, whichever side notices it.
 | `/leave` | Leave the current group |
 | `/safety` | Show the safety number of the current private chat |
 | `/file <path>` | Send a file |
+| `/history` | Show the chats this device kept for other accounts, read-only |
+| `/logout [--delete-history]` | Sign out: the token is revoked and this device's keys are deleted, and with the flag this account's history too |
 
 ---
 
@@ -202,8 +361,8 @@ only on the recipients'.
 ### 1.2 Key Types
 
 - **Identity keys**: A long-term X25519 pair and an Ed25519 signing key, generated on the
-  client (`identity.go`) and stored in `identity.key` (private X25519, public X25519,
-  signing seed). The private halves never leave the device. The public halves are
+  client (`identity.go`) and kept in the vault, sealed with the account key (private X25519,
+  public X25519, signing seed). The private halves never leave the device. The public halves are
   registered with the server at login.
 - **Signed prekey**: A medium-term X25519 pair whose public half the server hands out so
   that people can start a chat while its owner is offline. It is signed by the signing key,
@@ -276,7 +435,13 @@ hash, so the peer cannot be recovered from it — sessions store `PeerID` explic
 | `MaxGroupMembers` | 256 | Members in one group. |
 | `auxIdle` / `auxMaxMessages` | 5 min / 100 | How long the losing session of a simultaneous handshake stays readable. |
 | `maxRetiredInits` | 16 | Superseded handshakes remembered per conversation. |
-| `loginProofTimeout` | 10 s | How long the server waits for a login proof. |
+| `loginTimeout` | 30 s | How long a connection has to finish logging in, TLS handshake included. |
+| argon2id | t=2, 64 MiB, p=2 | Password hash cost (`defaultArgon`). |
+| `IPAttempts` / `IPWindow` | 30 / 1 min | Password logins and registrations allowed from one IP. Resumes, which never hash, get ten times that. |
+| `UserFailures` / `UserWindow` | 10 / 15 min | Wrong passwords allowed for one username before it is locked out for the rest of the window. |
+| `HashSlots` / `HashWait` | 4 / 10 s | Password hashes that may run at once, and how long an attempt waits for a slot. |
+| `MaxPreAuthBody` | 1 KiB | Largest packet the server reads before a login completes. |
+| `maxOfflineQueue` / `maxQueueBytes` | 5,000 / 64 MiB | A device's offline queue; the oldest are dropped first. |
 
 ---
 
@@ -362,21 +527,46 @@ nothing before.
 
 ### 2.3 Operations
 
-#### Login (`0x10 CtrlLogin` → `0x17 CtrlLoginChallenge` → `0x18 CtrlLoginProof` → `0x11 CtrlLoginAck`)
+#### Accounts and login
 
-- **Request**: a prekey bundle, then the username.
-  `[IdentityKey 32] [SigningKey 32] [SPKID 4] [SPK 32] [SPKSig 64] [Username]`
-- **Challenge**: `[Nonce 32]`, random per connection.
-- **Proof**: `[Signature 64]` over `"GoMesh-login-v1" ‖ nonce ‖ IdentityKey ‖ username`,
-  made with the signing key.
-- **Reply**: `[Assigned UserID 16]`
+Every connection is TLS 1.3, and the first packet must be one of three:
 
-The server refuses a bundle whose prekey signature does not verify before issuing a
-challenge. The identity key and signing key are pinned to the username on first use; a
-returning user must present both unchanged and sign the challenge. Only the signed prekey
-may change between logins, which is how it is rotated. A public bundle, which the server
-hands to anyone, is therefore not enough to log in as its owner. The server then binds the
-socket and flushes any offline queue.
+| Type | Body |
+| :--- | :--- |
+| `0x26 CtrlRegister` | `[ULen 1] [Username] [PLen 2] [Password] [PreKeyBundle 164] [DLen 1] [DeviceName]` |
+| `0x10 CtrlLogin` | Same layout as `CtrlRegister` |
+| `0x27 CtrlResume` | `[SessionToken 32] [PreKeyBundle 164]` |
+
+`PreKeyBundle` is `[IdentityKey 32] [SigningKey 32] [SPKID 4] [SPK 32] [SPKSig 64]`. `PLen`
+is two bytes because 128 characters of UTF-8 can exceed 255 bytes. Every one is then
+followed by the same challenge:
+
+- **Challenge** (`0x17 CtrlLoginChallenge`): `[Nonce 32]`, random per connection.
+- **Proof** (`0x18 CtrlLoginProof`): `[Signature 64]` over
+  `"GoMesh-login-v2" ‖ nonce ‖ IdentityKey ‖ username`, made with the signing key, where
+  the username is in its canonical lower-case form.
+- **Reply** (`0x11 CtrlLoginAck`): `[UserID 16] [SessionToken 32]`.
+
+A refusal is a `0xFF CtrlError` with body `[Code 1] [MsgLen 2] [Msg]`. The codes are bad
+request, wrong username or password, username taken, invalid username, weak password, rate
+limited, session revoked, device replaced, password required, and server error.
+
+- **Register** checks the username (3–32 characters of `a-z 0-9 _ .`, unique regardless of
+  case) and the password (while GoMesh is being tested, anything non-empty up to 512 bytes),
+  then stores an argon2id hash.
+- **Login** checks the password. If the bundle carries the account's current keys, it is the
+  same device: it gets a new token, and may present a newer signed prekey, which is how it
+  rotates one. If the keys are new, the account moves to them; see *Signing in on another
+  device*.
+- **Resume** looks the token up. It works only with the keys it was issued to: new keys get
+  "password required", and a token revoked by a move gets "device replaced", so an old
+  device learns why.
+
+Proving the signing key is still what stops someone who knows a public bundle, which the
+server hands to anyone, from logging in as its owner: the password authenticates the
+account, and the proof shows the device holds the keys it presents. `CtrlLogout` (`0x28`)
+revokes the connection's token. Everything before the reply is read with a 1 KiB limit and
+one deadline.
 
 #### Private chat initialization (`0x15 CtrlDirectInit` → `0x16 CtrlDirectAck`)
 
@@ -430,6 +620,7 @@ PrevHash     = SHA-256("GoMesh-GroupChangeHash-v1" ‖ SignedChange of the previ
 | `leave` | the member leaving | Names only themselves. **The last admin may not leave a group that has other members**; they promote someone first. |
 | `promote` | an admin | Targets must be non-admin members. |
 | `demote` | an admin | Must leave at least one admin. |
+| `rekey` | the member being rekeyed, **with the new key** | Names only themselves, with a new identity key and a new signing key. Role unchanged. |
 
 A change that introduces someone carries their identity and signing keys, signed by the
 admin who vouches for them, so the log is self-contained: later signatures verify against
@@ -449,6 +640,23 @@ automatically.
 | `0x1B CtrlGroupLogRq` | client → server | `[GroupID 16] [FromVersion 4]`. Members only. Answered with every later change, then a `CtrlGroupHints`. |
 | `0x1C CtrlGroupHints` | server → client | `[GroupID 16] [HintCount 2]` then per member `[ID 16] [NameLen 2] [Name] [PrekeyBundle 164]`. |
 | `0x24 CtrlUserLookupRq` / `0x25 CtrlUserLookupAck` | | A username in; `[ID 16] [PrekeyBundle 164] [Name]` out, or empty if there is no such user. Needed to name a person in a change. |
+| `0x29 CtrlKeyChange` | server → client | `[ID 16] [PrekeyBundle 164] [Name]`: a contact moved to new keys. Sent to everyone who shares a conversation with them. |
+| `0x2A CtrlMyGroups` | server → client | `[Count 2]` then per group `[GroupID 16] [NameLen 2] [Name]`, at every login. |
+| `0x2B CtrlSessionReset` | client → server → peer | Empty, over a 1:1 conversation only: "I cannot read you; start a new session." |
+| `0x2C CtrlDelivered` | client → server | `[Count 8]`: how many packets the client has handled on this connection since signing in. See *3.2 Delivery*. |
+| `0x05 MsgReadReceipt` | client → server → peer | `[ID 16]…`, one to 256 message IDs the sender of this packet has read. Encrypted over the 1:1 conversation (the pair's own, for a group message), so the server relays it without knowing which messages. Never fanned out to a group. See *Receipts*. |
+| `0x2D CtrlMsgAccepted` | server → sender | `[At 8]`: the server took the message named in the header's `MessageID`. A reply: dropped, not requeued, if its connection never acknowledged it. |
+| `0x2E CtrlMsgDelivered` | server → sender | `[Recipient 16] [At 8]`: that recipient's device has handled the message. Durable: queued for an offline sender. |
+| `0x2F CtrlReceiptsRq` | client → server | `[Since 8]`: unix milliseconds. Answered with the sender's `CtrlMsgAccepted` and `CtrlMsgDelivered` packets for messages taken since then, at most 2,000 messages and at most 14 days back. |
+
+**Who is settled.** Clients do not check changes against keys learned outside the log,
+because a log that rekeys someone holds their older keys too. They check where keys are
+used instead. A member is *settled* when the client's 1:1 session with them is on the keys
+the log names. Only settled members are given this client's sender key. A sender key is
+installed only if the session it arrived over was on the keys the log names for its owner;
+otherwise it is held until the log catches up. A member the directory says has new keys
+the log lacks is *moving*: they are left out, without holding anyone else up, until their
+rekey arrives. A member who is unsettled with no move to explain it gets a warning.
 
 **Hints** are directory data (a name and a prekey bundle) so that direct sessions can be
 opened without a round trip. They are not signed; a client keeps one only if its bundle
@@ -457,6 +665,39 @@ verifies and matches the identity and signing keys the signed log names for that
 The server also registers the **pairwise conversations** between all members when a group
 is created or grown, so sender keys have somewhere to be relayed. It refuses to fan a
 `CtrlSenderKey` out to a group.
+
+#### Receipts
+
+An outgoing message is kept with what it has been told, as sets of user IDs: who it was for
+when it went out, which of them the server says have it, and which say they read it. Its
+ticks are computed from those sets and from who is in the chat now, so a member who has left
+stops holding the ticks back.
+
+- **Taken.** After the membership checks, `handleData` records the message in the
+  `msg_receipts` table (one row per recipient, keyed by the message ID the header carries,
+  which encryption leaves alone) and sends the sender a `CtrlMsgAccepted`. Only
+  `MsgText` and `MsgMediaMeta` get receipts; a receipt never causes another.
+- **Delivered.** When a recipient's device acknowledges the packet (`CtrlDelivered`), the
+  server looks the message up in `msg_receipts`, not in the packet it handed over, marks that
+  recipient, and tells the sender, once: a packet delivered again after a dropped connection is
+  not reported twice. "Delivered" means the device's client handled the packet. It is
+  acknowledged in batches, so the second tick can lag a moment, and a packet parked for a
+  missing sender key or dropped as unreadable is acknowledged too.
+- **Read.** The server cannot know. When a person reads a chat, the reader's engine sends
+  each sender a `MsgReadReceipt` over the channel the two share, encrypted like a message. The
+  receiver takes it as coming from whoever sent the packet, and only if that person was a
+  recipient. A read while offline is kept (`ReadWanted` against `ReadSent` in the chat's
+  record) and sent on the next connection. With the Settings switch off, nothing is sent and
+  what was read in the meantime is never reported.
+- **What the server learns.** It already saw who messaged whom, and when. It now keeps that for
+  14 days in `msg_receipts` (and prunes it), and can see that a read receipt was sent and when,
+  but not which message it names.
+- **Missed receipts.** On every connection the engine asks for what it missed since the newest
+  time the server gave it. An `accepted` reply lost with a dropped connection is recovered
+  that way, and a stalled reader is never disconnected for the server's replies to it.
+- **Lookup.** History rows are sealed, so a message is found by a keyed hash of its ID kept in
+  a `mid` column. A receipt that beats the message into the history waits, bounded and for at
+  most two minutes, and is applied when the message is kept.
 
 #### Sending, receiving and rotating
 
@@ -503,31 +744,65 @@ not match. The server sees neither the file bytes nor the decryption key.
 
 ## 3. Server Architecture (`server/server.go`)
 
-A TCP broker handling concurrent connections, state, and routing.
+A TLS broker handling concurrent connections, state, and routing. Its state lives in SQLite (`store.go`) and is loaded at start; what is in memory mirrors it.
 
 ### 3.1 State
 
-- **Users** (`users`, `usernames`): user records, each with its prekey bundle (identity key,
-  signing key and signed prekey, all public) and a per-user offline queue.
+- **Users** (`users`, `usernames`): user records, each with its password hash, its prekey
+  bundle (identity key, signing key and signed prekey, all public) and its current
+  **device**. The offline queue belongs to the device, not the account, so a move to new
+  keys drops the old queue with the old device. Users and devices are loaded from SQLite at
+  start.
 - **Connections** (`clients`, `conns`): active sockets, guarded by `sync.RWMutex`.
 - **Conversations** (`convs`): both 1-to-1 and group, each with a member list used to
   authorize routing. A group also holds its signed change log and the membership it
-  defines.
+  defines. A two-party conversation is stored with its members, whether a `/dm` or a group
+  made it; a group is stored as its log, which is replayed at start **without** directory
+  pins, since a log that rekeyed someone holds older keys than the directory's. A group
+  change is applied to a copy, stored, and only then made current.
 
 ### 3.2 Delivery
 
 Each connection has exactly one writer goroutine (`writeLoop`), so packets are framed in
 order without a write lock. Producers hand packets over via `enqueue`, which never blocks:
 a recipient more than `sendBufferSize` (128) packets behind is treated as stalled and
-disconnected, and its backlog spills to the offline queue. The offline queue is capped at
-512 packets per user and **drops the oldest first**.
+disconnected, and its backlog spills to its device's offline queue. The offline queue is
+capped at 5,000 packets and 64 MiB per device and **drops the oldest first**. A packet
+spilled or requeued for a device the account no longer uses is dropped, and a connection
+retired by a move writes its "replaced" notice before anything else and then closes.
+
+**Acknowledgements.** Writing a packet to a socket does not deliver it: an iPhone can be
+suspended, or change networks, with it unread. So each connection keeps the packets it has
+written, in order, until the client acknowledges them with `CtrlDelivered`. The count only
+grows, so the header carries no sequence numbers.
+
+- **When the client acknowledges:** it counts every packet its read loop handles, and
+  acknowledges after a quiet 250 ms, every 64 packets, and before it disconnects on purpose.
+- **When a connection ends,** whatever it wrote but had not had acknowledged goes back on
+  the device's queue, ahead of what it had not written yet.
+- **Replies are the exception:** answers to a request (a `CtrlDirectAck`, `CtrlUploadAck`
+  and the like) meant something only to the connection that asked, so they are dropped.
+- **Backpressure:** at 1,024 unacknowledged packets the server stops writing to that
+  connection until an acknowledgement comes, and closes it if none comes within a minute.
+- **A device that reconnects before its old connection is noticed gone:** the new
+  connection waits for the old one to put its packets back before draining the queue, so
+  none are stranded.
+
+The offline queue is stored row by row. When a device connects, its queue is written to it
+and each row is deleted once its packet has been acknowledged: exactly that row, never a
+range, because a dying connection can put older packets back after a newer one was written.
+Whatever is taken but not acknowledged, however the drain ends, goes back on the queue with
+the rows it already has. `Close` waits for every write loop, and each spills its unsent
+packets to the store first, and for every read loop, which may be routing a last packet
+into an offline queue. A shutdown that arrives before the listener is up stops the server
+all the same.
 
 ### 3.3 Processing
 
-1. **`handleConnection`** — forces a login packet, checks the prekey bundle, issues the login
-   challenge and verifies the signed reply (`proveKeyPossession`), then pins the keys
-   (`authenticateUser`), binds the socket, flushes the offline queue, and reads in a loop.
-   Every inbound packet has its `SenderID` overwritten with the authenticated user ID.
+1. **`handleConnection`** — runs the login (`authenticate` in `accounts.go`: register,
+   password login or resume, then `proveKeyPossession`), binds the socket, flushes the
+   device's offline queue, and reads in a loop. Every inbound packet has its `SenderID`
+   overwritten with the authenticated user ID; a retired connection's packets are dropped.
 2. **`handleData`** — looks the conversation up, verifies the sender is a member, and fans
    out to everyone else. A **blind relay**: with `FlagEncrypted` set it never inspects the
    body. Carries `MsgText`, `MsgMediaMeta`, and `CtrlSenderKey` (two-party conversations only).
@@ -547,26 +822,52 @@ disconnected, and its backlog spills to the offline queue. The offline queue is 
 
 ## 4. Client Internals
 
-### 4.1 `IdentityManager` (`client/identity.go`) and `StateStore` (`client/store.go`)
+The engine is the `core` module: one `Client` per signed-in account, with no globals, no
+printing and no knowledge of screens. Everything for the user leaves as an `Event`
+(`events.go`); the terminal client in `client/` and the Apple apps are hosts that
+show them. `api.go` is the surface hosts call.
 
-`identity.key` holds the X25519 private and public keys and the Ed25519 signing seed. A
-file from before signing keys existed holds only the first two and is upgraded in place,
-keeping the identity key peers already know. The public key is re-derived from the private
-key at runtime. The file is written atomically with owner-only permissions.
+### 4.1 Keys at rest: the vault, `IdentityManager` (`core/identity.go`) and `StateStore` (`core/store.go`)
+
+The **vault** holds small secrets: the Keychain on Apple devices, 0600 files in the
+terminal client. It holds the **account key**, a random key made when this device first
+signs in, which everything else is sealed under; the identity keys, sealed with it; and the
+session token. A vault read that fails for any reason other than "not found" is an error
+to retry, never taken for an empty vault, since new keys made over old ones would orphan
+every session. Sign-out deletes the account key first, so whatever else is left behind can
+never be opened.
+
+The identity keys are the X25519 private and public keys and the Ed25519 signing seed. A
+plaintext `identity.key` from an earlier version is moved into the vault on first open,
+including one from before signing keys existed, which keeps the X25519 pair peers know and
+gains a signing key.
 
 The manager also owns the **signed prekeys**: it creates the first on first run, advertises
 the current one in the login bundle, and keeps the private half of a retired one for 30
 days so someone who fetched the old bundle just before a rotation can still reach it.
 
-`StateStore` keeps one gob-encoded record per file in `gomesh-state/`. Each write goes to a
+`StateStore` keeps one gob-encoded record per file in `state/`, sealed with
+XChaCha20-Poly1305 under a key derived from the account key. Each file is named by an HMAC
+of the record's name, the seal is bound to that file name, and the record's real name is
+inside it: a listing says nothing about which chat a file is for, a file copied over
+another does not open, and `List` finds records by opening them. Each write goes to a
 temporary file that is synced and renamed into place, then the directory is synced, so a
-crash leaves the old record or the new one and never a torn mixture. The directory is
-bound to one identity key; if `identity.key` is replaced, the old records are discarded.
-A record that cannot be decoded is an error, never treated as absent.
+crash leaves the old record or the new one and never a torn mixture. A record that cannot
+be opened or decoded is an error, never treated as absent, and is left in place. Plaintext
+records from an earlier version are sealed and deleted on first open; if a crash left both,
+the sealed copy wins.
 
-### 4.2 `SessionManager` (`client/session.go`)
+**History** (`core/history.go`) is one SQLite file per device. Each account's rows are
+sealed with its own history key, which sign-out keeps, so an earlier account's chats stay
+readable, read-only. Only a tag per conversation (an HMAC of the account and the
+conversation) and a sequence number per message are in the clear, and each row is bound to
+both. A received message is recorded before the host hears of it. Files are kept in
+`media/`, sealed with the history key, under random names, and leave only through
+`ExportMedia`. Deleting an account's history deletes its rows, its files and its key.
 
-**Direct sessions** (`client/ratchet.go`). `OpenDirectSession` builds the initiator's side
+### 4.2 `SessionManager` (`core/session.go`)
+
+**Direct sessions** (`core/ratchet.go`). `OpenDirectSession` builds the initiator's side
 from a verified bundle and sends nothing. The responder's side is built by `DecryptPacket`
 when a message with handshake fields matches no session it holds.
 
@@ -594,7 +895,7 @@ when a message with handshake fields matches no session it holds.
   replaced, whether by a forced `/dm` or by the peer's restart. The client uses it to
   discard packets held for the old session, which could never be read.
 
-**Group state** (`client/group.go`). A `groupState` per group is saved atomically and holds
+**Group state** (`core/group.go`). A `groupState` per group is saved atomically and holds
 the verified `Membership`, this member's own sender key (`ownSenderKey`), each peer's
 current and previous sender key (`peerKeys`), sender keys held while membership catches up,
 and the directory hints. `GroupSession` and the per-sender epoch scheme are gone.
@@ -609,8 +910,11 @@ and the directory hints. `GroupSession` and the per-sender epoch scheme are gone
   cannot be fetched again, so rejecting it would lose the key until its owner next rotates.
 - `DecryptGroupPacket` checks the header against the packet, the sender against the
   verified membership, then the signature, and only then steps the chain on a copy.
-- `PeerKeysChanged` handles a peer whose session was replaced: it forgets their keys and
-  that they hold ours, and marks ours for replacement.
+- `PeerKeysChanged` handles a peer whose session was restarted on the same keys: it forgets
+  their keys and that they hold ours, and marks ours for replacement.
+- `NoteDirectoryKey` takes the directory's word that a user has new keys: in every group
+  whose log names other keys for them it marks them as moving, drops their old bundle, and
+  marks ours for replacement. Applying their signed rekey ends it.
 
 **Shared ratchet handling.** `advanceChain` derives the message key for a sequence number
 and returns a *prospective* chain state. Nothing is written back until the ciphertext
@@ -624,7 +928,7 @@ a replay consume a stored skipped key that a genuine late message still needed.
 (bad tag, duplicate, retired epoch), which is what decides whether a packet is held or
 dropped.
 
-### 4.3 `pendingQueue` (`client/pending.go`)
+### 4.3 `pendingQueue` (`core/pending.go`)
 
 Holds packets whose key has not arrived and replays them when it does — released by
 conversation when a roster lands, or by conversation *and sender* when a sender key lands,
@@ -636,7 +940,7 @@ per conversation, 512 overall, and a 30-second TTL. The per-conversation cap kee
 traffic than for a long backlog. Global eviction charges the conversation holding the most.
 The TTL sweep runs on insertion, so there is no background goroutine to manage.
 
-### 4.4 Flow (`client/client.go`)
+### 4.4 Flow (`core/client.go`, `core/connection.go`)
 
 `readLoop` decodes from the socket and hands each packet to `deliver`, which decrypts and
 dispatches — or, if the key has not arrived, holds it:
@@ -674,10 +978,16 @@ roster requested, as before. Once any direct message reads successfully, packets
 that conversation are replayed, which is how a message waiting on an earlier epoch is
 released.
 
+A handshake under keys the client's directory does not give for the sender is held too,
+and the roster requested, rather than dropped: the sender may have moved. If the roster
+names the new keys, the old session is closed with a "safety number changed" warning and
+the held handshake builds the new one.
+
 If the roster arrives and there is still no session, nothing held can ever be read: the
 peer has an established session and no longer sends handshake fields, and a roster carries
-no prekey bundle to open one with. This is what a lost state directory looks like from the
-receiving end. The held packets are discarded, and the user is told to run `/dm <name>`.
+no prekey bundle to open one with. This is what a lost state directory, or a move the peer
+has not heard of, looks like from the receiving end. The held packets are discarded and the
+peer is sent a session reset.
 
 An unknown *group* message initially takes the direct branch, because `IsGroup` returns
 false for anything unregistered. That resolves itself: the roster reply says which it
@@ -694,7 +1004,14 @@ not verified, or from a sender whose key has not arrived, is held for up to
 `GroupPendingTTL` and replayed when the log advances or the key lands. A send that cannot
 yet reach every member is queued and retried when their bundles arrive.
 
-### 4.5 `ClientManager` (`client/manager.go`)
+**Reconnecting.** When the connection drops, the client reports `connecting` and resumes
+with the saved session over the pinned certificate, backing off from 1 s to 30 s with
+jitter. It never asks a question from the background: a server whose certificate is not
+pinned is not connected to, and a session that needs the password is handed to the host as
+an event. A device that turns out to have been replaced, or whose session ended, signs out.
+While offline, a send is refused before anything is encrypted, so no message key is burned.
+
+### 4.5 `ClientManager` (`core/manager.go`)
 
 Tracks conversations, usernames, and cached public keys for display and early command
 checks. For groups its member and admin sets are copied from the verified membership;
@@ -704,14 +1021,59 @@ nothing cryptographic reads them.
 hashes and encrypts the file, requests a signed upload URL, PUTs the ciphertext, and sends
 the envelope. On receipt the item appears inline immediately (with an ANSI half-block
 thumbnail for images) while a background download fetches, decrypts, verifies the hash,
-and saves to `downloads/`.
+and keeps the file sealed in `media/`; the terminal client then exports a copy to
+`downloads/`.
 
-### 4.6 TUI (`client/ui.go`)
+### 4.6 TUI (`client/`)
 
 A Bubble Tea split-screen: conversation sidebar with unread counts, message viewport, and
 a system log. Slash commands with tab completion and parameter hints (including `/safety`,
 which shows the safety number for the current private chat), plus a progress bar for
-transfers.
+transfers. It is a thin host over `core`: it asks for the server and the password, turns
+engine events into screen messages, shows `Reconnecting…` while the engine reconnects, and
+loads a chat's history from the device when you switch to it.
+
+### 4.7 The bridge and the Apple apps (`bridge/`, `apps/apple/`)
+
+`bridge` is what gomobile binds: an `Engine` per data directory whose methods take and
+return strings, numbers and bools, with anything richer as JSON and every ID as hex.
+
+- **Events** reach the app through one `EventHandler.OnEvent(kind, payload)`, from a
+  goroutine of the bridge's own, in order, so a slow screen never holds up the engine. The
+  app's handler only queues each event onto the main thread.
+- **Errors** are all `*bridge.Error`, whose text is `{"code","message"}`. The code is the
+  one thing the app branches on: `bad_credentials` goes under the password field,
+  `username_taken` under the username, `unreachable` and `pin_mismatch` under the server;
+  `offline` means nothing was encrypted or sent. One function decides every code, and a test
+  covers each.
+- **The vault** is implemented in Swift. Empty data from `Get` means the item is not there,
+  the one case in which the engine may make new keys; any error, a locked device
+  included, stays an error, so an unreadable Keychain is never taken for an empty one. The
+  adapter refuses to store an empty item for the same reason.
+- **Lifecycle.** Opening a directory closes whichever engine had it, and `Close` waits for
+  the read and reconnect loops, cancelling a dial in progress. An engine that signs out is
+  spent; the app opens a new one on the same folder. `Register` and `Login` refuse on an
+  engine that already has an account started.
+- **Trust** takes two calls: `CheckServer` returns the fingerprint and whether it is pinned,
+  and `TrustServer` pins exactly the one the app showed. Sign-in refuses a server that is
+  not pinned.
+
+The Swift side (`apps/apple/GoMesh/`) is one SwiftUI target for macOS and iOS. `Engine/`
+wraps the bridge and runs every call that touches the network on a background task;
+`App/AppState.swift` holds the screen, account and connection on the main actor;
+`Vault/Vault.swift` keeps each item in the data-protection Keychain, this device only and
+readable after first unlock, updated in place, and sealed again to a Secure Enclave P-256
+key with ECIES and AES-GCM bound to the item's name.
+
+**Themes** are defined once, in `design/themes.json`: 8 light, 12 dark, each with a
+background, two surfaces, a border, text and muted text, an accent and the text on it, the
+two bubble colours and their text, danger, warning and success, and an 8-colour palette
+for avatars and names. Every published palette's colours are taken from its source, which
+the file names and `design/gen_themes.py` reads to produce the file; anything adjusted for contrast is listed in that theme's `notes`, and the
+canonical accent is kept wherever only the bubble needed darkening. A test in `bridge`
+checks all twenty: every pairing of text and ground at 4.5:1 or better, and warning and
+success at 3:1. Auto follows the system with a light and a dark theme of the person's
+choosing.
 
 ---
 
@@ -733,9 +1095,11 @@ transfers.
   removed member cannot read anything sent after they left.
 - **Group senders cannot be forged.** Members hold each other's chain keys, so the
   per-message Ed25519 signature is what proves who wrote something.
-- **The server cannot edit membership.** Changes are signed by an admin, chained by hash,
-  and checked by every client, so a server that adds itself, reorders, or invents a change
-  is refused. It can still withhold changes, which shows as a group that stops growing.
+- **The server cannot add or remove members.** Changes are signed by an admin, chained by
+  hash, and checked by every client, so a server that adds itself, reorders, or invents a
+  change is refused. It can still withhold changes, which shows as a group that stops
+  growing. The one thing it could do is swap a member's keys with a forged rekey, which every
+  member is shown; see *Known limitations*.
 - **Authorization is checked twice.** The server refuses invalid changes, and every client
   re-checks from the signed log. Public keys are only released to conversation members.
 - **Bounded resources.** Skipped keys are capped at 1000 ahead in a direct chat and in a
@@ -743,7 +1107,8 @@ transfers.
   held sender keys at 64 per group, verified groups at 256 (plus at most 32 placeholders for
   groups only heard of through a sender key, which expire after 7 days, and 512 records of
   groups left), buffered membership changes at 64,
-  retained private ratchet keys at 20 unanswered epochs, offline queues at 512 per user.
+  retained private ratchet keys at 20 unanswered epochs, offline queues at 5,000 packets and
+  64 MiB per device.
 
 **Also holds, for direct chats and groups:**
 
@@ -754,7 +1119,13 @@ transfers.
 - **Self-healing.** After a compromise, the next rotation mixes in a key generated
   afterwards plus the peer's contribution, so a copied state stops reading new messages
   once the two sides have exchanged one round.
-- **Login is authenticated.** The signing key is pinned and proven at every login.
+- **Login is authenticated.** A password (or a token issued to these exact keys) proves the
+  account, and a signature over a fresh challenge proves the device holds its keys.
+- **Passwords are hashed and guessing is throttled.** argon2id with a per-account salt;
+  attempts are limited per IP and per username before any hash runs, and only a few hashes
+  run at once.
+- **The transport is encrypted.** TLS 1.3 only, and clients accept only the certificate they
+  pinned.
 - **Crash safety.** State is saved before a message leaves, so a restart does not reuse a
   message key.
 
@@ -773,4 +1144,4 @@ transfers.
 - A direction is stuck if every message of one epoch is lost. A single lost message is
   harmless, and `/dm <name>` on either side recovers a stuck chat at the cost of what was
   in flight.
-- Ratchet state on disk is not encrypted.
+- The terminal client's vault is plain files; see *Known limitations*.

@@ -1,0 +1,18 @@
+// Build settings for the GoMesh app that differ from machine to machine. The
+// defaults here build and run on this Mac and in the simulator with no Apple
+// developer account. Settings for your own machine go in Local.xcconfig, which
+// git ignores: copy Local.xcconfig.example and fill it in.
+
+// Signing. Without a development team the app is signed to run locally only.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+
+// The Mac's entitlements. A team-signed build uses GoMesh-Signed.entitlements,
+// which adds the Keychain; see Local.xcconfig.example.
+GOMESH_MAC_ENTITLEMENTS = Config/GoMesh.entitlements
+
+// The server the sign-in screen suggests. Empty means localhost:8080.
+GOMESH_DEFAULT_SERVER =
+
+#include? "Local.xcconfig"

@@ -29,6 +29,9 @@ struct ConversationView: View {
 
     var body: some View {
         messages
+            #if os(macOS)
+            .safeAreaInset(edge: .top, spacing: 0) { floatingHeader }
+            #endif
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if let reason = readOnlyReason {
                     Label(reason, systemImage: "lock.fill")
@@ -45,17 +48,16 @@ struct ConversationView: View {
         .background(ChatBackground())
         .sensoryFeedback(.impact(weight: .light), trigger: model.sent)
         .sensoryFeedback(.error, trigger: model.failed)
-        .navigationTitle(title)
         #if os(iOS)
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(theme.surface, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         // A chat is full screen on the iPhone, where the tab bar would sit under the
         // composer; on the iPad the tab bar is how to reach Settings, so it stays.
         .toolbar(sizeClass == .compact ? .hidden : .automatic, for: .tabBar)
-        #endif
         .toolbar {
-            ToolbarItem(placement: Self.headerPlacement) { header }.withoutGlass()
+            ToolbarItem(placement: .principal) { header }.withoutGlass()
             if case .live = selection, readOnlyReason == nil {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showInfo = true } label: { Image(systemName: "info.circle") }
@@ -63,8 +65,6 @@ struct ConversationView: View {
                 }
             }
         }
-        #if os(macOS)
-        .modifier(MacToolbar())
         #endif
         #if os(macOS)
         // On the Mac, info sits beside the chat.
@@ -119,9 +119,33 @@ struct ConversationView: View {
     }
 
     #if os(macOS)
-    private static let headerPlacement = ToolbarItemPlacement.navigation
-    #else
-    private static let headerPlacement = ToolbarItemPlacement.principal
+    /// The chat's header floats over it as a rounded bar: who it is and what
+    /// it is, and on the right the chat's info.
+    private var floatingHeader: some View {
+        HStack(spacing: 10) {
+            header
+            Spacer(minLength: 8)
+            if case .live = selection, readOnlyReason == nil {
+                Button { showInfo.toggle() } label: {
+                    Image(systemName: "info.circle")
+                        .font(.title3)
+                        .foregroundStyle(showInfo ? theme.accentText : theme.textMuted)
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isGroup ? "Group info" : "Contact info")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 50)
+        .background(theme.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.border))
+        .shadow(color: .black.opacity(0.1), radius: 6, y: 1)
+        .padding(.horizontal, 6)
+        .padding(.top, 6)
+        .padding(.bottom, 2)
+    }
     #endif
 
     /// The avatar, the name, and a line under it: how many are in a group, or
@@ -148,13 +172,10 @@ struct ConversationView: View {
         return String(localized: "end-to-end encrypted")
     }
 
-    /// The chat is a centred column on a wide window, and a bubble is at most
-    /// this much of it.
-    private static let columnWidth: CGFloat = 780
 
     private var messages: some View {
         GeometryReader { geo in
-            messageScroll(bubbleWidth: min(min(geo.size.width, Self.columnWidth) * 0.78, 560))
+            messageScroll(bubbleWidth: min(geo.size.width * 0.7, 640))
         }
     }
 
@@ -190,7 +211,6 @@ struct ConversationView: View {
                     Color.clear.frame(height: 1).id(bottomID)
 
                 }
-                .frame(maxWidth: Self.columnWidth)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .frame(maxWidth: .infinity)
@@ -282,27 +302,6 @@ private extension ToolbarContent {
     }
 }
 
-#if os(macOS)
-/// The detail's toolbar carries the chat's own header, so the window title
-/// would say the name twice, and it needs a ground of its own: messages scroll
-/// under it. Both options are macOS 15; on 14 the title stays and the bar is
-/// the system's.
-private struct MacToolbar: ViewModifier {
-    @Environment(\.theme) private var theme
-
-    func body(content: Content) -> some View {
-        if #available(macOS 15, *) {
-            content
-                .toolbar(removing: .title)
-                .toolbarBackground(theme.surface, for: .windowToolbar)
-                .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
-        } else {
-            content
-        }
-    }
-}
-#endif
-
 /// Offers its content at most `maxWidth`, and takes the size the content
 /// chooses: a bubble hugs its text up to the cap. `frame(maxWidth:)` would
 /// stretch it to the cap instead.
@@ -343,12 +342,9 @@ struct DaySeparator: View {
 
     var body: some View {
         Text(ChatFormat.day(date))
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(theme.textMuted)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(theme.surfaceRaised, in: Capsule())
-            .padding(.vertical, 10)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(theme.text)
+            .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
             .accessibilityAddTraits(.isHeader)
     }
@@ -543,20 +539,23 @@ struct Composer: View {
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            // The pill floats over the chat: attach, the message, and on the Mac
-            // the emoji picker.
+            AttachButton(chatID: model.chatID)
+                .background(theme.surface, in: Circle())
+                .overlay(Circle().stroke(theme.border.opacity(0.6)))
+
+            // The pill floats over the chat: the message, and on the Mac the
+            // emoji picker.
             HStack(alignment: .bottom, spacing: 0) {
-                AttachButton(chatID: model.chatID)
                 // The draft lives on the chat's model, so it is still there after
                 // switching chats and back, for as long as the app runs.
-                TextField("", text: $model.draft, prompt: Text("Message").foregroundStyle(theme.textMuted), axis: .vertical)
+                TextField("", text: $model.draft, prompt: Text("Write a message…").foregroundStyle(theme.textMuted), axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...6)
                     .foregroundStyle(theme.text)
                     .focused($focused)
                     .accessibilityLabel("Message")
                     .padding(.vertical, 10)
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 12)
                     #if os(macOS)
                     .onKeyPress(.return, phases: .down) { press in
                         if press.modifiers.contains(.shift) { return .ignored }
@@ -582,25 +581,22 @@ struct Composer: View {
             }
             .padding(.horizontal, 4)
             .background(theme.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(theme.border))
-            .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(theme.border.opacity(0.6)))
 
             Button(action: send) {
                 Image(systemName: "arrow.up")
                     .font(.body.weight(.bold))
-                    .foregroundStyle(theme.onAccent)
+                    .foregroundStyle(canSend ? theme.onAccent : theme.textMuted)
                     .frame(width: buttonSize + 4, height: buttonSize + 4)
-                    .background(theme.accent.opacity(canSend ? 1 : 0.4), in: Circle())
-                    .shadow(color: .black.opacity(0.1), radius: 4, y: 1)
+                    .background(canSend ? theme.accent : theme.surface, in: Circle())
+                    .overlay(Circle().stroke(theme.border.opacity(canSend ? 0 : 0.6)))
             }
             .buttonStyle(.plain)
             .disabled(!canSend)
             .accessibilityLabel("Send")
         }
-        .frame(maxWidth: 780)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
         .overlay(alignment: .top) {
             if app.connection != .online {
                 Text(app.connection == .connecting ? "Connecting… messages send once you're back online."

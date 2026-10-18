@@ -329,6 +329,45 @@ final class AppState {
         // The signedOut event finishes the job.
     }
 
+    /// Signs out and deletes everything GoMesh keeps on this device: every
+    /// account's chats, files and keys, signed-in or not, and every trusted
+    /// server. The app starts over as a fresh install.
+    func deleteAllData() async {
+        guard let folder else { return }
+        let old = engine
+        engine = nil
+        generation += 1 // the old engine's events, signedOut included, are dropped
+        account = nil
+        Notifier.shared.clearAll()
+        TempFiles.clearAll()
+        chats = []
+        earlier = []
+        models = [:]
+        selectedChat = nil
+        connection = .offline
+        connectionText = ""
+        await old?.logout(deleteHistory: true)
+        await old?.close()
+        do {
+            if FileManager.default.fileExists(atPath: folder.root.path) {
+                try FileManager.default.removeItem(at: folder.root)
+            }
+            let (store, kind) = try Vault.chooseStore(devFolder: folder.devVault)
+            _ = try folder.prepare { try store.deleteAll() }
+            let vault = try Vault.open(store: store, kind: kind)
+            self.vault = vault
+            vaultDescription = vault.kind.rawValue + (vault.usesSecureEnclave ? ", sealed by the Secure Enclave" : "")
+            try openEngine()
+            authNotice = nil
+            suggestedUsername = ""
+            phase = .welcome
+        } catch let e as EngineError {
+            phase = .failed(e.message)
+        } catch {
+            phase = .failed("GoMesh could not delete its data: \(error)")
+        }
+    }
+
     /// The engine is spent once it signs out: close it, open a fresh one on the
     /// same folder, and start over.
     private func restart(notice: String?, toSignIn: Bool) {

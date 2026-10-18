@@ -280,12 +280,12 @@ add('github-light', 'GitHub Light', 'light', SRC['primer'], dict(
 
 # --- dark ---
 add('telegram-dark', 'Telegram Dark', 'dark', 'original', dict(
-    bg='#0e1621', surface='#17212b', surfaceRaised='#242f3d', border='#1f2c3a', text='#f5f5f5', textMuted='#8a9bab',
-    chatPattern='#1b2a3a',
-    accent='#6ab3f3', onAccent='#0e1621', selectedRow='#2b5278', onSelectedRow='#ffffff',
+    bg='#1c1c1c', surface='#282828', surfaceRaised='#333333', border='#3a3a3a', text='#f5f5f5', textMuted='#9a9a9f',
+    chatPattern='#1c1c1c',
+    accent='#0a74e0', accentText='#4da3ff', onAccent='#ffffff', selectedRow='#0062cb', onSelectedRow='#ffffff',
     danger='#ff6b6b', warning='#f5b341', success='#4fd07e',
-    bubbleOut='#2b5278', onBubbleOut='#ffffff', metaOut='#9dc4ea', tickRead='#8fd0ff',
-    bubbleIn='#182533', onBubbleIn='#f5f5f5', metaIn='#7e91a3',
+    bubbleOut='#0363ce', onBubbleOut='#ffffff', metaOut='#e3efff', tickRead='#8fd0ff',
+    bubbleIn='#313131', onBubbleIn='#f5f5f5', metaIn='#9a9a9f',
     palette=['#ff7a85', '#ff9a56', '#f0c24b', '#6fd35a', '#4fd1c5', '#5cb2ff', '#b59cff', '#ff8cc0']))
 add('gomesh-dark', 'GoMesh Dark', 'dark', 'original', dict(
     bg='#0e1016', surface='#151821', surfaceRaised='#1e2230', border='#2a2f3d', text='#e9ebf3', textMuted='#9ca3b8',

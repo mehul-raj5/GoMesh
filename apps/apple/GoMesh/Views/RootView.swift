@@ -31,6 +31,11 @@ struct RootView: View {
                 HomeView()
             }
         }
+        #if os(macOS)
+        // Clear of the window's buttons on every screen but the chats, which lay
+        // themselves out around them.
+        .padding(.top, app.phase == .signedIn ? 0 : 28)
+        #endif
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.bg.ignoresSafeArea())
         .overlay(alignment: .bottom) { toast }

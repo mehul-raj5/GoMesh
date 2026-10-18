@@ -24,9 +24,14 @@ struct GoMeshApp: App {
                     await app.launch()
                 }
                 #if os(macOS)
-                .frame(minWidth: 720, minHeight: 520)
+                .frame(minWidth: 900, minHeight: 520)
                 #endif
         }
+        #if os(macOS)
+        // The sidebar is a panel with the window's buttons inside it, so the
+        // title bar goes and the content runs under it.
+        .windowStyle(.hiddenTitleBar)
+        #endif
         .onChange(of: scenePhase) { _, phase in
             lock.sceneChanged(phase)
             app.scenePhaseChanged(phase)

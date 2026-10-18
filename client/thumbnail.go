@@ -5,9 +5,9 @@ import (
 	common "common"
 	"fmt"
 	"image"
+	_ "image/gif" // register GIF decoder
 	"image/jpeg"
-	_ "image/gif"  // register GIF decoder
-	_ "image/png"  // register PNG decoder
+	_ "image/png" // register PNG decoder
 	"strings"
 )
 
@@ -18,32 +18,30 @@ const (
 	thumbMaxH = 30
 )
 
-// makeThumbnail returns a small JPEG preview for image files, or nil for
-// non-images / on failure. Uses only the standard library (nearest-neighbor
-// downscale) so no image-resize dependency is required.
-func makeThumbnail(fileType string, data []byte) []byte {
-	if !strings.HasPrefix(fileType, "image/") {
-		return nil
-	}
-	src, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil
-	}
-
-	b := src.Bounds()
-	tw, th := scaleToFit(b.Dx(), b.Dy(), thumbMaxW, thumbMaxH)
-	small := resizeNearest(src, tw, th)
-
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, small, &jpeg.Options{Quality: 60}); err != nil {
-		return nil
-	}
-	return buf.Bytes()
-}
-
 // renderThumbnail decodes a thumbnail JPEG and returns inline terminal art using
 // unicode upper-half-blocks (▀): the top pixel colors the glyph foreground, the
 // bottom pixel colors its background, giving two vertical pixels per cell.
+// shrink scales img down, picking a source pixel for each cell, to fit maxW×maxH.
+func shrink(img image.Image, maxW, maxH int) image.Image {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= maxW && h <= maxH {
+		return img
+	}
+	tw, th := maxW, h*maxW/w
+	if th > maxH {
+		th, tw = maxH, w*maxH/h
+	}
+	tw, th = max(tw, 1), max(th, 1)
+	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
+	for y := 0; y < th; y++ {
+		for x := 0; x < tw; x++ {
+			dst.Set(x, y, img.At(b.Min.X+x*w/tw, b.Min.Y+y*h/th))
+		}
+	}
+	return dst
+}
+
 func renderThumbnail(thumb []byte) string {
 	if len(thumb) == 0 {
 		return ""
@@ -52,6 +50,7 @@ func renderThumbnail(thumb []byte) string {
 	if err != nil {
 		return ""
 	}
+	img = shrink(img, thumbMaxW, thumbMaxH) // the engine sends them bigger, for the apps
 
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -102,42 +101,6 @@ func scaleToFit(w, h, maxW, maxH int) (int, int) {
 	return tw, th
 }
 
-// resizeNearest downscales src to tw×th using nearest-neighbor sampling.
-func resizeNearest(src image.Image, tw, th int) *image.RGBA {
-	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
-	b := src.Bounds()
-	for y := 0; y < th; y++ {
-		sy := b.Min.Y + y*b.Dy()/th
-		for x := 0; x < tw; x++ {
-			sx := b.Min.X + x*b.Dx()/tw
-			dst.Set(x, y, src.At(sx, sy))
-		}
-	}
-	return dst
-}
-
-// emitMediaMessage renders a received/sent media item into the conversation
-// pane. When a thumbnail is present it is drawn inline above the caption.
-func emitMediaMessage(convID [16]byte, sender string, meta common.MediaMetadata) {
-	if program == nil {
-		return
-	}
-
-	caption := formatMediaLine(meta)
-	content := caption
-	if art := renderThumbnail(meta.Thumbnail); art != "" {
-		// Leading newline so the art starts at column 0, below the "sender:" prefix.
-		content = "\n" + art + "\n" + caption
-	}
-
-	go program.Send(NetworkMsg{
-		ConversationID: convID,
-		SenderName:     sender,
-		Content:        content,
-		IsFile:         true,
-	})
-}
-
 func formatMediaLine(meta common.MediaMetadata) string {
 	icon := "\U0001F4CE" // 📎
 	if strings.HasPrefix(meta.FileType, "image/") {
@@ -157,4 +120,15 @@ func humanSize(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+// mediaMessage renders a received or sent file for the conversation pane, with
+// its thumbnail drawn inline above the caption when there is one.
+func mediaMessage(convID [16]byte, sender string, meta common.MediaMetadata) NetworkMsg {
+	content := formatMediaLine(meta)
+	if art := renderThumbnail(meta.Thumbnail); art != "" {
+		// Leading newline so the art starts at column 0, below the "sender:" prefix.
+		content = "\n" + art + "\n" + content
+	}
+	return NetworkMsg{ConversationID: convID, SenderName: sender, Content: content, IsFile: true}
 }

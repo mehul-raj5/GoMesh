@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 )
 
 // maxGroupName bounds a group's display name.
@@ -109,6 +110,12 @@ func (s *Server) handleGroupCreate(sender *Client, p common.Packet) {
 	}
 	conv.Members = conv.Membership.MemberIDs()
 	conv.Log = []common.SignedChange{sc}
+	if err := s.store.CreateGroup(groupID, body.Name, sc); err != nil {
+		s.mu.Unlock()
+		log.Printf("[ERROR] could not store group %x: %v", groupID[:4], err)
+		s.reject(sender, groupID, &sc, 0, "server error")
+		return
+	}
 	s.convs[groupID] = conv
 	s.ensurePairwiseConvsLocked(conv.Members)
 	hints := s.hintsLocked(conv.Members)
@@ -155,7 +162,9 @@ func (s *Server) handleGroupChange(sender *Client, p common.Packet) {
 		s.reject(sender, groupID, &sc, 0, "not a member")
 		return
 	}
-	if a := sc.Change.Action; a == common.ActionAdd {
+	// An add vouches for new members' keys, and a rekey for the actor's new ones:
+	// either way they must be the keys the account registered.
+	if a := sc.Change.Action; a == common.ActionAdd || a == common.ActionRekey {
 		if err := s.checkTargetsLocked(sc.Change.Targets); err != nil {
 			head := conv.Membership.Version
 			s.mu.Unlock()
@@ -164,8 +173,11 @@ func (s *Server) handleGroupChange(sender *Client, p common.Packet) {
 		}
 	}
 
+	// The change is applied to a copy, stored, and only then made current, so
+	// what the server serves and what it would load after a restart agree.
 	before := append([][common.IDSize]byte(nil), conv.Members...)
-	eff, err := conv.Membership.Apply(&sc, func(id [common.IDSize]byte) ([32]byte, bool) {
+	next := conv.Membership.Clone()
+	eff, err := next.Apply(&sc, func(id [common.IDSize]byte) ([32]byte, bool) {
 		return s.directoryPinLocked(id)
 	})
 	if err != nil {
@@ -181,6 +193,14 @@ func (s *Server) handleGroupChange(sender *Client, p common.Packet) {
 		s.reject(sender, groupID, &sc, head, reason)
 		return
 	}
+	if err := s.store.AppendGroupChange(groupID, sc); err != nil {
+		head := conv.Membership.Version
+		s.mu.Unlock()
+		log.Printf("[ERROR] could not store a change to group %x: %v", groupID[:4], err)
+		s.reject(sender, groupID, &sc, head, "server error")
+		return
+	}
+	conv.Membership = next
 	conv.Members = conv.Membership.MemberIDs()
 	conv.Log = append(conv.Log, sc)
 	if len(eff.Added) > 0 {
@@ -194,12 +214,17 @@ func (s *Server) handleGroupChange(sender *Client, p common.Packet) {
 	for _, a := range eff.Added {
 		recipients = append(recipients, a.ID)
 	}
+	// Hints go with whoever the change introduces, or gives new keys, so members
+	// can open sessions to them without another round trip.
+	var ids [][common.IDSize]byte
+	for _, a := range eff.Added {
+		ids = append(ids, a.ID)
+	}
+	for _, r := range eff.Rekeyed {
+		ids = append(ids, r.ID)
+	}
 	var hints []common.GroupHint
-	if len(eff.Added) > 0 {
-		ids := make([][common.IDSize]byte, len(eff.Added))
-		for i, a := range eff.Added {
-			ids[i] = a.ID
-		}
+	if len(ids) > 0 {
 		hints = s.hintsLocked(ids)
 	}
 	out := common.GroupChangeBody{Name: conv.Name, Change: sc, Hints: hints}
@@ -207,6 +232,9 @@ func (s *Server) handleGroupChange(sender *Client, p common.Packet) {
 	// A group nobody belongs to any more is gone.
 	if len(conv.Members) == 0 {
 		delete(s.convs, groupID)
+		if err := s.store.DeleteConversation(groupID); err != nil {
+			log.Printf("[ERROR] could not delete group %x from the store: %v", groupID[:4], err)
+		}
 	}
 	s.mu.Unlock()
 
@@ -279,10 +307,76 @@ func (s *Server) handleGroupLogRq(sender *Client, p common.Packet) {
 	})
 }
 
+// myGroups lists the groups an account belongs to. It is sent at every login, so
+// a device that has just taken the account over can find its groups and rekey
+// them, and one coming back after a while can catch up.
+func (s *Server) myGroups(userID [common.IDSize]byte) []common.GroupRef {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []common.GroupRef
+	for id, c := range s.convs {
+		if c.IsGroup && c.Membership.IsMember(userID) {
+			out = append(out, common.GroupRef{ID: id, Name: c.Name})
+		}
+	}
+	return out
+}
+
+func (s *Server) sendMyGroups(userID [common.IDSize]byte) {
+	groups := s.myGroups(userID)
+	if len(groups) == 0 {
+		return
+	}
+	if len(groups) > common.MaxMyGroups {
+		groups = groups[:common.MaxMyGroups]
+	}
+	body := common.EncodeMyGroups(groups)
+	s.sendPacket(userID, common.Packet{
+		Header: common.Header{MsgType: common.CtrlMyGroups, BodyLen: uint32(len(body))},
+		Body:   body,
+	})
+}
+
+// broadcastKeyChange tells everyone who shares a conversation with an account
+// that it has new keys, with its new bundle. For a direct chat that is enough to
+// start a new session; groups wait for the account's own signed rekey.
+func (s *Server) broadcastKeyChange(userID [common.IDSize]byte) {
+	s.mu.RLock()
+	u, ok := s.users[userID]
+	if !ok {
+		s.mu.RUnlock()
+		return
+	}
+	body := (&common.UserLookup{ID: userID, Name: u.Username, Bundle: u.Bundle}).Encode()
+	seen := map[[common.IDSize]byte]bool{userID: true}
+	var to [][common.IDSize]byte
+	for _, c := range s.convs {
+		if !c.HasMember(userID) {
+			continue
+		}
+		for _, m := range c.Members {
+			if !seen[m] {
+				seen[m] = true
+				to = append(to, m)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	pkt := common.Packet{
+		Header: common.Header{MsgType: common.CtrlKeyChange, SenderID: userID, BodyLen: uint32(len(body))},
+		Body:   body,
+	}
+	for _, id := range to {
+		s.sendPacket(id, pkt)
+	}
+	log.Printf("Told %d contact(s) that %s has new keys", len(to), u.Username)
+}
+
 // handleUserLookup answers a username with the ID and bundle behind it, which is
 // what a client needs to name someone in a membership change it signs.
 func (s *Server) handleUserLookup(sender *Client, p common.Packet) {
-	name := string(p.Body)
+	name := strings.ToLower(string(p.Body))
 
 	s.mu.RLock()
 	var body []byte

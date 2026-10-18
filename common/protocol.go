@@ -13,6 +13,11 @@ const HeaderSize = 16 + 16 + 16 + 1 + 2 + 4
 const (
 	MsgText      uint8 = 0x01
 	MsgMediaMeta uint8 = 0x04 // E2E-encrypted media metadata envelope (Supabase direct-upload)
+	// MsgReadReceipt tells the sender of messages that the sender of this packet
+	// has read them. Its body, the IDs of the messages read, is encrypted over
+	// the 1:1 channel the two share, so the server relays it without knowing
+	// which messages it is about. It is never sent to a group.
+	MsgReadReceipt uint8 = 0x05
 
 	CtrlLogin      uint8 = 0x10
 	CtrlLoginAck   uint8 = 0x11
@@ -59,10 +64,73 @@ const (
 	CtrlUserLookupRq  uint8 = 0x24 // client -> server: body is the username
 	CtrlUserLookupAck uint8 = 0x25 // server -> client: an encoded UserLookup, or empty
 
+	// Accounts. CtrlRegister and CtrlLogin carry Credentials, CtrlResume a
+	// session token; each is then followed by the signed challenge, and answered
+	// with a CtrlLoginAck carrying the user ID and the session token. CtrlLogout
+	// ends the session its connection belongs to.
+	CtrlRegister uint8 = 0x26
+	CtrlResume   uint8 = 0x27
+	CtrlLogout   uint8 = 0x28
+
+	// Moving an account to a new device. CtrlKeyChange tells everyone who shares
+	// a conversation with the account that it now has new keys; its body is an
+	// encoded UserLookup. CtrlMyGroups lists, at every login, the groups the
+	// account belongs to, so a new device can find and rekey them. A client that
+	// cannot read a peer sends CtrlSessionReset over their 1:1 conversation, with
+	// an empty body, asking the peer to start a new session.
+	CtrlKeyChange    uint8 = 0x29
+	CtrlMyGroups     uint8 = 0x2A
+	CtrlSessionReset uint8 = 0x2B
+
+	// Delivery. A packet the server has written may still be lost: a phone can
+	// be suspended, or change networks, with it unread. So the client says how
+	// many packets it has handled on this connection since signing in, a count
+	// that only grows, and the server keeps each written packet until a count
+	// covers it. What is not covered when the connection ends is delivered again
+	// on the next one; clients ignore what they have already read.
+	CtrlDelivered uint8 = 0x2C // client -> server: body is an 8-byte count
+
+	// Receipts. The server tells a message's sender that it took the message
+	// (CtrlMsgAccepted) and, for each recipient, that the recipient's device has
+	// handled it (CtrlMsgDelivered). Both name the message in MessageID and its
+	// conversation in ConversationID. A sender that has been away asks for what
+	// it missed with CtrlReceiptsRq, whose answer is those packets again.
+	CtrlMsgAccepted  uint8 = 0x2D // server -> sender: body is the time, in unix milliseconds
+	CtrlMsgDelivered uint8 = 0x2E // server -> sender: body is the recipient's ID, then the time
+	CtrlReceiptsRq   uint8 = 0x2F // client -> server: body is a time, in unix milliseconds
+
 	CtrlError uint8 = 0xFF
 
 	FlagEncrypted uint16 = 1 << 0
 )
+
+// IsReply reports whether a server packet answers a request on the connection
+// that made it. A reply that a connection did not acknowledge is not delivered
+// again on the next one: whoever was waiting for it has given up, and the
+// request can be made again.
+func IsReply(msgType uint8) bool {
+	switch msgType {
+	case CtrlDirectAck, CtrlConvInfoAck, CtrlUploadAck, CtrlDownloadAck, CtrlUserLookupAck,
+		CtrlGroupChangeReject, CtrlGroupHints, CtrlMyGroups, CtrlMsgAccepted, CtrlError:
+		return true
+	}
+	return false
+}
+
+// DeliveredPacket is a client's acknowledgement that it has handled n packets
+// on this connection.
+func DeliveredPacket(n uint64) Packet {
+	body := binary.BigEndian.AppendUint64(nil, n)
+	return Packet{Header: Header{MsgType: CtrlDelivered, BodyLen: uint32(len(body))}, Body: body}
+}
+
+// DecodeDelivered reads the count from a CtrlDelivered body.
+func DecodeDelivered(body []byte) (uint64, error) {
+	if len(body) != 8 {
+		return 0, fmt.Errorf("delivered: %d-byte body", len(body))
+	}
+	return binary.BigEndian.Uint64(body), nil
+}
 
 type Header struct {
 	MessageID      [IDSize]byte
@@ -109,7 +177,17 @@ func (p *Packet) Encode(w io.Writer) error {
 	return nil
 }
 
+// MaxBody is the largest body Decode accepts.
+const MaxBody = 100 * 1024 * 1024
+
 func Decode(r io.Reader) (Packet, error) {
+	return DecodeMax(r, MaxBody)
+}
+
+// DecodeMax reads one packet whose body may be at most max bytes. The server
+// uses a small max for everything it reads before a login completes, so an
+// unauthenticated peer cannot make it allocate a large body.
+func DecodeMax(r io.Reader, max uint32) (Packet, error) {
 	var p Packet
 	buf := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -123,7 +201,7 @@ func Decode(r io.Reader) (Packet, error) {
 	p.Header.Flags = binary.BigEndian.Uint16(buf[49:])
 	p.Header.BodyLen = binary.BigEndian.Uint32(buf[51:])
 
-	if p.Header.BodyLen > 1024*1024*100 {
+	if p.Header.BodyLen > max {
 		return p, fmt.Errorf("body too large: %d", p.Header.BodyLen)
 	}
 
@@ -446,19 +524,6 @@ func (b *PreKeyBundle) Verify() bool {
 		return false
 	}
 	return VerifyPreKey(b.SigningKey, b.SPKID, b.SPK, b.SPKSig)
-}
-
-// EncodeLogin builds a CtrlLogin body: the bundle, then the username.
-func EncodeLogin(b *PreKeyBundle, username string) []byte {
-	return append(b.Encode(), username...)
-}
-
-func DecodeLogin(body []byte) (PreKeyBundle, string, error) {
-	b, err := DecodePreKeyBundle(body)
-	if err != nil {
-		return b, "", err
-	}
-	return b, string(body[PreKeyBundleSize:]), nil
 }
 
 // --- Ratchet header ---

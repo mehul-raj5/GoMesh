@@ -332,7 +332,7 @@ const LoginNonceSize = 32
 // the nonce is fresh per connection so a captured proof cannot be replayed.
 func loginMessage(nonce [LoginNonceSize]byte, ik [KeySize]byte, username string) []byte {
 	msg := make([]byte, 0, 15+LoginNonceSize+KeySize+len(username))
-	msg = append(msg, "GoMesh-login-v1"...)
+	msg = append(msg, "GoMesh-login-v2"...)
 	msg = append(msg, nonce[:]...)
 	msg = append(msg, ik[:]...)
 	return append(msg, username...)

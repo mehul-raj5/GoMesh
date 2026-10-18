@@ -1,0 +1,66 @@
+# The GoMesh server as a systemd service. See docs/deploy-ec2.md.
+#
+#   sudo install -m 0644 gomesh.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now gomesh
+
+[Unit]
+Description=GoMesh chat server
+Documentation=https://github.com/mehul-raj5/GoMesh/blob/main/docs/deploy-ec2.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gomesh
+Group=gomesh
+# Settings and secrets (the Supabase service key), readable by root and gomesh only.
+EnvironmentFile=/etc/gomesh/gomesh.env
+ExecStart=/usr/local/bin/gomesh-server
+# The database lives in /var/lib/gomesh, which systemd creates for the service.
+StateDirectory=gomesh
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/gomesh
+UMask=0077
+
+# SIGTERM makes the server stop cleanly: every connection puts what it had not
+# delivered into the database before it closes. Give it time to.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+# Enough open files for many connections.
+LimitNOFILE=65536
+
+# Hardening: the server needs the network, its database and its certificate,
+# and nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# The usual set for a service. A call outside it fails rather than killing the
+# server; the Go runtime raises its file limit at startup, for one.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

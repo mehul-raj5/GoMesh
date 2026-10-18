@@ -1,0 +1,54 @@
+# XcodeGen spec for the GoMesh app. `make xcodeproj` turns it into
+# GoMesh.xcodeproj, which is generated and not committed.
+name: GoMesh
+options:
+  bundleIdPrefix: com.mehulraj
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  GoMesh:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    platform: auto
+    sources:
+      - path: GoMesh
+      # The themes are defined once, for every platform, in design/.
+      - path: ../../design/themes.json
+        buildPhase: resources
+    dependencies:
+      - framework: Frameworks/GoMeshCore.xcframework
+        embed: false # gomobile builds a static framework
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mehulraj.gomesh
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: GoMesh
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.social-networking
+        # Go's runtime needs these system libraries.
+        OTHER_LDFLAGS: "-lresolv"
+        # The sandbox entitlements are the Mac's; iOS apps are sandboxed anyway,
+        # and signing for a phone rejects keys it does not know.
+        # GOMESH_MAC_ENTITLEMENTS comes from Config/Base.xcconfig, or from
+        # Local.xcconfig for a build signed with a team.
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": $(GOMESH_MAC_ENTITLEMENTS)
+        # Signing and the default server come from Config/Base.xcconfig and
+        # the untracked Config/Local.xcconfig, so they are not set here.
+        INFOPLIST_FILE: Config/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_NSFaceIDUsageDescription: GoMesh uses Face ID to unlock the app when App Lock is on.
+        ENABLE_HARDENED_RUNTIME: YES

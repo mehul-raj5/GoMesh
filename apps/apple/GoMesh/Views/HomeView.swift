@@ -31,22 +31,7 @@ struct ChatsHome: View {
     @FocusState private var searchFocused: Bool
 
     var body: some View {
-        NavigationSplitView {
-            VStack(spacing: 0) {
-                header
-                if app.connection != .online { connectionBar }
-                ChatListView(selection: $selection, search: $search)
-            }
-            .background(theme.surface)
-            .navigationTitle("Chats")
-            #if os(macOS)
-            .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
-            #else
-            .toolbar(.hidden, for: .navigationBar)
-            #endif
-        } detail: {
-            detail
-        }
+        layout
         .tint(theme.accentText)
         .onChange(of: selection) {
             // Only a live chat counts as on screen for reading and notifications.
@@ -94,6 +79,124 @@ struct ChatsHome: View {
         }
     }
 
+    @ViewBuilder private var layout: some View {
+        #if os(macOS)
+        // The sidebar floats as a rounded panel over the chat's ground, with the
+        // window's own buttons inside it.
+        HStack(spacing: 0) {
+            sidebarPanel
+            detail
+        }
+        .background(theme.chatBg.ignoresSafeArea())
+        #else
+        NavigationSplitView {
+            VStack(spacing: 0) {
+                header
+                if app.connection != .online { connectionBar }
+                ChatListView(selection: $selection, search: $search)
+            }
+            .background(theme.surface)
+            .navigationTitle("Chats")
+            .toolbar(.hidden, for: .navigationBar)
+        } detail: {
+            detail
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    private var sidebarPanel: some View {
+        VStack(spacing: 0) {
+            // The traffic lights sit at the left; the title stays centred.
+            ZStack {
+                Text("Chats").font(.headline).foregroundStyle(theme.text)
+                HStack {
+                    Spacer()
+                    Menu {
+                        Button("New chat", systemImage: "person") { showNewChat = true }
+                        Button("New group", systemImage: "person.3") { showNewGroup = true }
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                            .font(.title3)
+                            .foregroundStyle(theme.accentText)
+                            .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.plain)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(app.connection != .online)
+                    .accessibilityLabel("New chat or group")
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 44)
+
+            searchPill
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            if app.connection != .online { connectionBar }
+            ChatListView(selection: $selection, search: $search)
+            tabBar
+        }
+        .frame(width: 310)
+        .background(theme.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(theme.border))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+        .padding(.leading, 6)
+        .padding(.vertical, 6)
+        .padding(.trailing, 4)
+    }
+
+    /// What there is to switch between: the chats, who you are signed in as,
+    /// and Settings. There is no calls or contacts screen to point at.
+    private var tabBar: some View {
+        let unread = app.chats.reduce(Int64(0)) { $0 + $1.unread }
+        return HStack {
+            Menu {
+                if let name = app.account?.username {
+                    Label(name, systemImage: "person.crop.circle").disabled(true)
+                }
+            } label: {
+                Image(systemName: "person.crop.circle.fill").font(.title2)
+                    .foregroundStyle(theme.textMuted).frame(width: 44, height: 40).contentShape(Rectangle())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Account")
+            Spacer()
+            Image(systemName: "bubble.left.and.bubble.right.fill").font(.title2)
+                .foregroundStyle(theme.accentText).frame(width: 44, height: 40)
+                .overlay(alignment: .topTrailing) {
+                    if unread > 0 {
+                        Text(unread > 99 ? "99+" : "\(unread)")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(theme.bg)
+                            .padding(.horizontal, 5)
+                            .frame(minWidth: 18, minHeight: 18)
+                            .background(theme.danger, in: Capsule())
+                            .offset(x: 6, y: -2)
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Chats, \(unread) unread")
+            Spacer()
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape.fill").font(.title2)
+                    .foregroundStyle(theme.textMuted).frame(width: 44, height: 40).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Settings")
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 6)
+        .overlay(alignment: .top) { Rectangle().fill(theme.border.opacity(0.5)).frame(height: 1) }
+    }
+    #endif
+
     /// The menu and the search pill that head the sidebar.
     private var header: some View {
         HStack(spacing: 8) {
@@ -123,28 +226,39 @@ struct ChatsHome: View {
             .fixedSize()
             .accessibilityLabel("Menu")
 
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(theme.textMuted).accessibilityHidden(true)
-                TextField("", text: $search, prompt: Text("Search").foregroundStyle(theme.textMuted))
-                    .textFieldStyle(.plain)
-                    .foregroundStyle(theme.text)
-                    .focused($searchFocused)
-                    .autocorrectionDisabled()
-                    .accessibilityLabel("Search chats")
-                if !search.isEmpty {
-                    Button { search = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(theme.textMuted)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Clear search")
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(minHeight: 38)
-            .background(theme.surfaceRaised, in: Capsule())
+            searchPill
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+
+    #if os(macOS)
+    private static let searchPrompt = "Search (⌘K)"
+    #else
+    private static let searchPrompt = "Search"
+    #endif
+
+    private var searchPill: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(theme.textMuted).accessibilityHidden(true)
+            TextField("", text: $search, prompt: Text(Self.searchPrompt).foregroundStyle(theme.textMuted))
+                .textFieldStyle(.plain)
+                .foregroundStyle(theme.text)
+                .focused($searchFocused)
+                .autocorrectionDisabled()
+                .accessibilityLabel("Search chats")
+            if !search.isEmpty {
+                Button { search = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(theme.textMuted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 36)
+        .background(theme.surfaceRaised.opacity(0.6), in: Capsule())
+        .overlay(Capsule().stroke(theme.border.opacity(0.7)))
     }
 
     /// Shown only when not online; online is the ordinary state.
@@ -189,9 +303,9 @@ struct ChatsHome: View {
     private var placeholder: some View {
         VStack(spacing: 12) {
             MeshMark(size: 64)
-            Text("Select a chat").font(.title3.weight(.medium)).foregroundStyle(theme.textMuted)
+            Text("Select a chat to start messaging").font(.callout.weight(.medium)).foregroundStyle(theme.text)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(theme.bg)
+        .background(theme.chatBg)
     }
 }

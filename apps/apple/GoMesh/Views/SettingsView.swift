@@ -8,6 +8,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     var inSheet = false
     @State private var confirmSignOut = false
+    @State private var confirmDeleteAll = false
     @AppStorage(Notifier.previewsKey) private var showPreviews = false
     @State private var deleteHistory = false
     @State private var lockProblem: String?
@@ -49,6 +50,8 @@ struct SettingsView: View {
                         Toggle("Also delete this account's chats from this device", isOn: $deleteHistory)
                         Button("Sign out", role: .destructive) { confirmSignOut = true }
                             .foregroundStyle(theme.danger)
+                        Button("Delete all data and sign out", role: .destructive) { confirmDeleteAll = true }
+                            .foregroundStyle(theme.danger)
                     }
                     .listRowBackground(theme.surface)
                 }
@@ -80,6 +83,14 @@ struct SettingsView: View {
                 Text(deleteHistory
                      ? "This device's keys and this account's chats will be deleted."
                      : "This device's keys will be deleted. Its chats stay readable here, but nobody can send from them.")
+            }
+            .confirmationDialog("Delete all data?", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
+                Button("Delete all data and sign out", role: .destructive) {
+                    dismiss()
+                    Task { await app.deleteAllData() }
+                }
+            } message: {
+                Text("Every account's chats and files on this device, and all keys, will be deleted, and you will be signed out. GoMesh starts over as if just installed. This can't be undone.")
             }
         }
         .tint(theme.accentText)

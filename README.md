@@ -1,5 +1,20 @@
 # GoMesh: Comprehensive Project Documentation
 
+> **Platform support: GoMesh currently works only on the Mac.**
+>
+> - **Mac:** download `GoMesh-mac.zip` from the latest release and move `GoMesh.app` to
+>   Applications. The app is not signed for distribution, so macOS will refuse to open it.
+>   Remove the quarantine flag once, then open it:
+>
+>   ```bash
+>   xattr -cr /Applications/GoMesh.app
+>   ```
+>
+> - **iOS:** there is no ready-to-install build. Get the project, sign it with your own Apple
+>   ID in Xcode (add your account under Xcode → Settings → Accounts and pick your team for the
+>   GoMesh target), turn on Developer Mode on the iPhone (Settings → Privacy & Security →
+>   Developer Mode), and build and run it onto the phone from Xcode.
+
 `GoMesh` is a secure messaging application supporting end-to-end encrypted (E2EE) private
 chats, end-to-end encrypted group chats, and file transfers over a custom protocol on TLS 1.3.
 

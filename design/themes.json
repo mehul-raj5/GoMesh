@@ -487,27 +487,27 @@
       "appearance": "dark",
       "source": "original",
       "colors": {
-        "bg": "#0e1621",
-        "surface": "#17212b",
-        "surfaceRaised": "#242f3d",
-        "border": "#1f2c3a",
+        "bg": "#1c1c1c",
+        "surface": "#282828",
+        "surfaceRaised": "#333333",
+        "border": "#3a3a3a",
         "text": "#f5f5f5",
-        "textMuted": "#8a9bab",
-        "accent": "#6ab3f3",
-        "accentText": "#6ab3f3",
-        "onAccent": "#0e1621",
-        "bubbleOut": "#2b5278",
+        "textMuted": "#9a9a9f",
+        "accent": "#0a74e0",
+        "accentText": "#4da3ff",
+        "onAccent": "#ffffff",
+        "bubbleOut": "#0363ce",
         "onBubbleOut": "#ffffff",
-        "bubbleIn": "#182533",
+        "bubbleIn": "#313131",
         "onBubbleIn": "#f5f5f5",
         "danger": "#ff6b6b",
         "warning": "#f5b341",
         "success": "#4fd07e",
-        "chatPattern": "#1b2a3a",
-        "selectedRow": "#2b5278",
+        "chatPattern": "#1c1c1c",
+        "selectedRow": "#0062cb",
         "onSelectedRow": "#ffffff",
-        "metaOut": "#a1c7eb",
-        "metaIn": "#7e91a3",
+        "metaOut": "#e3efff",
+        "metaIn": "#9a9a9f",
         "tickRead": "#8fd0ff",
         "palette": [
           "#ff7a85",
@@ -531,7 +531,9 @@
         ]
       },
       "notes": [
-        "metaOut #9dc4ea -> #a1c7eb for 4.5:1 on bubbleOut"
+        "colours sampled from the reference screenshots: neutral grey surfaces, a bright blue selected row and outgoing bubble; chatPattern equals bg so the chat shows no dots",
+        "accent #2ea5ff -> #0a74e0 so white reads on it at 4.5:1; accentText #4da3ff is the lighter blue for text and links",
+        "metaOut is #e3efff for 4.5:1 on bubbleOut"
       ]
     },
     {

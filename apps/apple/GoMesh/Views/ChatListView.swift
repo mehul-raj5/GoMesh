@@ -7,40 +7,106 @@ struct ChatListView: View {
     @Environment(\.theme) private var theme
     @Binding var selection: ChatSelection?
     @Binding var search: String
+    #if os(macOS)
+    @FocusState private var focused: Bool
+    #endif
 
     var body: some View {
+        #if os(macOS)
+        macList
+        #else
+        phoneList
+        #endif
+    }
+
+    private func liveRow(_ c: ChatSummary) -> ChatRow {
+        ChatRow(name: c.name, isGroup: c.isGroup, preview: preview(c), date: c.lastDate,
+                unread: c.unread, readOnly: c.readOnly, selected: selection == .live(c.id),
+                tick: c.previewFromMe ? c.previewDelivery.map { TickState(status: "sent", delivery: $0) } : nil)
+    }
+
+    private func keptRow(_ account: String, _ k: KeptChat) -> ChatRow {
+        ChatRow(name: k.name, isGroup: k.isGroup, preview: keptPreview(k), date: k.lastDate, unread: 0,
+                readOnly: true, selected: selection == .kept(account: account, chat: k.id))
+    }
+
+    private func earlierHeader(_ account: HistoryAccount) -> some View {
+        Text("Earlier on this device · \(account.username)")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(theme.textMuted)
+            .padding(.horizontal, 6)
+    }
+
+    #if os(macOS)
+    /// The chats as plain rows in a scroll view rather than a `List`: the Mac's
+    /// list draws its own highlight in the system accent, which the rounded bar
+    /// in the theme's `selectedRow` would have to fight. Up and down move the
+    /// selection, as they do in a list.
+    private var macList: some View {
         let chats = filtered(app.chats)
-        List(selection: $selection) {
+        let order: [ChatSelection] = chats.map { .live($0.id) }
+            + app.earlier.flatMap { g in g.chats.filter { matches($0.name) }.map { ChatSelection.kept(account: g.account.id, chat: $0.id) } }
+        return ScrollView {
+            LazyVStack(spacing: 0) {
+                if chats.isEmpty && app.earlier.isEmpty { empty }
+                ForEach(chats) { c in
+                    Button { selection = .live(c.id); focused = true } label: { liveRow(c) }
+                        .buttonStyle(.plain)
+                        .macRowBar(selected: selection == .live(c.id))
+                }
+                ForEach(app.earlier, id: \.account.id) { group in
+                    let kept = group.chats.filter { matches($0.name) }
+                    if !kept.isEmpty {
+                        earlierHeader(group.account).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 12)
+                        ForEach(kept) { k in
+                            Button { selection = .kept(account: group.account.id, chat: k.id); focused = true } label: { keptRow(group.account.id, k) }
+                                .buttonStyle(.plain)
+                                .macRowBar(selected: selection == .kept(account: group.account.id, chat: k.id))
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.bottom, 6)
+        }
+        .scrollContentBackground(.hidden)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.upArrow) { step(-1, in: order); return .handled }
+        .onKeyPress(.downArrow) { step(1, in: order); return .handled }
+    }
+
+    private func step(_ delta: Int, in order: [ChatSelection]) {
+        guard !order.isEmpty else { return }
+        let at = selection.flatMap { order.firstIndex(of: $0) }
+        selection = order[max(0, min(order.count - 1, (at ?? (delta > 0 ? -1 : order.count)) + delta))]
+    }
+    #else
+    private var phoneList: some View {
+        let chats = filtered(app.chats)
+        return List(selection: $selection) {
             if chats.isEmpty && app.earlier.isEmpty {
                 empty
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
             ForEach(chats) { c in
-                let picked = selection == .live(c.id)
-                ChatRow(name: c.name, isGroup: c.isGroup, preview: preview(c), date: c.lastDate,
-                        unread: c.unread, readOnly: c.readOnly, selected: picked,
-                        tick: c.previewFromMe ? c.previewDelivery.map { TickState(status: "sent", delivery: $0) } : nil)
+                liveRow(c)
                     .tag(ChatSelection.live(c.id))
-                    .rowChrome(selected: picked)
+                    .rowChrome(selected: selection == .live(c.id))
             }
             ForEach(app.earlier, id: \.account.id) { group in
                 let kept = group.chats.filter { matches($0.name) }
                 if !kept.isEmpty {
                     Section {
                         ForEach(kept) { k in
-                            let picked = selection == .kept(account: group.account.id, chat: k.id)
-                            ChatRow(name: k.name, isGroup: k.isGroup,
-                                    preview: keptPreview(k), date: k.lastDate, unread: 0, readOnly: true,
-                                    selected: picked)
+                            keptRow(group.account.id, k)
                                 .tag(ChatSelection.kept(account: group.account.id, chat: k.id))
-                                .rowChrome(selected: picked)
+                                .rowChrome(selected: selection == .kept(account: group.account.id, chat: k.id))
                         }
                     } header: {
-                        Text("Earlier on this device · \(group.account.username)")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(theme.textMuted)
-                            .padding(.horizontal, 6)
+                        earlierHeader(group.account)
                     }
                 }
             }
@@ -49,6 +115,7 @@ struct ChatListView: View {
         .scrollContentBackground(.hidden)
         .background(theme.surface)
     }
+    #endif
 
     private var empty: some View {
         VStack(spacing: 10) {
@@ -85,29 +152,45 @@ struct ChatListView: View {
     }
 }
 
+#if os(macOS)
+private extension View {
+    /// The selected row is a rounded bar in the theme's `selectedRow`.
+    func macRowBar(selected: Bool) -> some View { modifier(MacRowBar(selected: selected)) }
+}
+
+private struct MacRowBar: ViewModifier {
+    @Environment(\.theme) private var theme
+    let selected: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .background(selected ? theme.selectedRow : Color.clear, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .contentShape(Rectangle())
+            .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+#endif
+
 /// The list row around a chat: no separator, and the selected one a solid
 /// rounded bar in the theme's `selectedRow`.
+#if os(iOS)
 private extension View {
     func rowChrome(selected: Bool) -> some View {
         modifier(RowChrome(selected: selected))
     }
 }
+#endif
 
+#if os(iOS)
 private struct RowChrome: ViewModifier {
     @Environment(\.theme) private var theme
     let selected: Bool
 
     @ViewBuilder private var bar: some View {
-        #if os(macOS)
-        // The Mac draws its own highlight under the selected row, which a
-        // rounded bar would leave showing at the edges: the bar fills the row.
-        Rectangle().fill(selected ? theme.selectedRow : Color.clear)
-        #else
         RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(selected ? theme.selectedRow : Color.clear)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
-        #endif
     }
 
     func body(content: Content) -> some View {
@@ -117,6 +200,7 @@ private struct RowChrome: ViewModifier {
             .listRowBackground(bar)
     }
 }
+#endif
 
 struct ChatRow: View {
     @Environment(\.theme) private var theme

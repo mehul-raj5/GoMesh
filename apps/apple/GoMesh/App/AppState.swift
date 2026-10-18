@@ -360,6 +360,7 @@ final class AppState {
             try openEngine()
             authNotice = nil
             suggestedUsername = ""
+            server = Self.defaultServer
             phase = .welcome
         } catch let e as EngineError {
             phase = .failed(e.message)
@@ -383,6 +384,7 @@ final class AppState {
         selectedChat = nil
         connection = .offline
         connectionText = ""
+        if !toSignIn { server = Self.defaultServer } // signed out here: back to the build's server
         Task {
             await old?.close()
             do {
